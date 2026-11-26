@@ -103,9 +103,14 @@ export default function App() {
     providerAvatar: string;
     watchCount: number;
     commentCount: number;
+    beginTime?: number;
   }>>([]);
   const [isLoadingLive, setIsLoadingLive] = useState<boolean>(false);
-  const [liveIdInput, setLiveIdInput] = useState<string>('');
+  const [liveSearchQuery, setLiveSearchQuery] = useState<string>('');
+  const [liveSearchSort, setLiveSearchSort] = useState<'viewCountDesc' | 'commentCountDesc' | 'recentDesc'>('viewCountDesc');
+  const [liveCategoryTab, setLiveCategoryTab] = useState<'all' | 'common' | 'game' | 'try' | 'face' | 'official'>('all');
+  const [liveTotalCount, setLiveTotalCount] = useState<number>(0);
+  const [liveSearchError, setLiveSearchError] = useState<string | null>(null);
   const [favoriteLiveAlerts, setFavoriteLiveAlerts] = useState<LiveProgram[]>([]);
   const [liveAlertsDismissed, setLiveAlertsDismissed] = useState<boolean>(false);
   const [seigaInput, setSeigaInput] = useState<string>('im10000000');
@@ -790,17 +795,56 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [subscriptions]);
 
-  const loadNicoLivePrograms = async () => {
+  const formatLiveElapsed = (beginTime?: number): string => {
+    if (!beginTime || beginTime <= 0) return '';
+    const diffSec = Math.max(0, Math.floor(Date.now() / 1000) - beginTime);
+    const mins = Math.floor(diffSec / 60);
+    if (mins < 60) return `${mins}分経過`;
+    const hours = Math.floor(mins / 60);
+    const remMins = mins % 60;
+    return `${hours}時間${remMins > 0 ? `${remMins}分` : ''}経過`;
+  };
+
+  const loadNicoLivePrograms = async (opts?: { q?: string; sort?: string; tab?: string }) => {
+    const q = (opts?.q !== undefined ? opts.q : liveSearchQuery).trim();
+    const sort = opts?.sort || liveSearchSort;
+    const tab = opts?.tab || liveCategoryTab;
     setIsLoadingLive(true);
+    setLiveSearchError(null);
     try {
-      const res = await fetch('/api/nico/live?sort=viewCount');
-      const data = await res.json();
-      if (data.success && Array.isArray(data.items)) {
-        setLivePrograms(data.items);
+      const params = new URLSearchParams();
+      if (q) params.set('q', q);
+      params.set('sort', sort);
+      if (!q && tab && tab !== 'all') params.set('tab', tab);
+      const res = await fetch(`/api/nico/live/search?${params.toString()}`);
+      const rawText = await res.text();
+      let data: any = null;
+      try {
+        data = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        data = null;
       }
-    } catch {} finally {
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || `生放送検索に失敗しました (HTTP ${res.status})`);
+      }
+      const items = Array.isArray(data.items) ? data.items : [];
+      setLivePrograms(items);
+      setLiveTotalCount(Number(data.total ?? items.length));
+    } catch (err: any) {
+      setLiveSearchError(err?.message || '放送中のLIVE一覧を取得できませんでした。');
+    } finally {
       setIsLoadingLive(false);
     }
+  };
+
+  const openLiveSearch = (initialQuery?: string) => {
+    const nextQ = initialQuery !== undefined ? initialQuery : liveSearchQuery;
+    setNicoHubTab('live');
+    if (initialQuery !== undefined) {
+      setLiveSearchQuery(initialQuery);
+    }
+    switchView('nico-hub');
+    void loadNicoLivePrograms({ q: nextQ, sort: liveSearchSort, tab: liveCategoryTab });
   };
 
   const playLiveProgram = async (p: {
@@ -2320,15 +2364,11 @@ export default function App() {
                   <button
                     type="button"
                     className="zero-secondary-btn"
-                    onClick={() => {
-                      setNicoHubTab('live');
-                      switchView('nico-hub');
-                      if (livePrograms.length === 0) void loadNicoLivePrograms();
-                    }}
+                    onClick={() => openLiveSearch()}
                     style={{ padding: '6px 12px', fontSize: '12.5px', gap: '5px' }}
                   >
                     <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
-                    <span>生放送 (LIVE)</span>
+                    <span>LIVE専用検索</span>
                   </button>
                 </div>
               </div>
@@ -2445,6 +2485,15 @@ export default function App() {
                   <span className="tabular-nums" style={{ color: 'var(--text-muted)', fontSize: '13px' }}>
                     {searchTotalCount > 0 ? searchTotalCount.toLocaleString() : searchResults.length}件
                   </span>
+                  <button
+                    type="button"
+                    className="zero-secondary-btn"
+                    onClick={() => openLiveSearch(searchQuery)}
+                    style={{ padding: '5px 10px', fontSize: '12px', gap: '5px' }}
+                  >
+                    <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+                    <span>{searchQuery.trim() ? `「${searchQuery.trim()}」の放送中LIVEを検索` : 'LIVE専用検索へ'}</span>
+                  </button>
                 </div>
               </div>
 
@@ -2985,67 +3034,230 @@ export default function App() {
                 </div>
 
                 {nicoHubTab === 'live' && (
-                  <div>
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        const m = liveIdInput.trim().match(/\b(lv\d+)\b/i);
-                        if (!m) {
-                          showPlayerNotification('lvから始まる生放送IDまたはURLを入力してください');
-                          return;
-                        }
-                        const lvId = m[1].toLowerCase();
-                        void playLiveProgram({ id: lvId, url: `https://live.nicovideo.jp/watch/${lvId}` });
-                      }}
-                      style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '12px' }}
-                    >
-                      <input
-                        type="text"
-                        className="zero-input"
-                        value={liveIdInput}
-                        onChange={(e) => setLiveIdInput(e.target.value)}
-                        placeholder="生放送ID・URLを直接再生（例: lv351891443）"
-                        style={{ flex: '1 1 220px' }}
-                      />
-                      <button type="submit" className="zero-primary-btn">
-                        生放送を視聴
-                      </button>
-                      <button
-                        type="button"
-                        className="zero-secondary-btn"
-                        onClick={() => void loadNicoLivePrograms()}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    {/* Dedicated ON_AIR Live Search Bar */}
+                    <div className="zero-surface-box" style={{ padding: '14px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <span style={{ width: '9px', height: '9px', borderRadius: '50%', background: '#ef4444', display: 'inline-block', boxShadow: '0 0 0 3px rgba(239, 68, 68, 0.2)' }} />
+                          <strong style={{ fontSize: '15px' }}>LIVEやってるの専用検索（現在放送中のみ）</strong>
+                        </div>
+                        <span className="tabular-nums" style={{ fontSize: '12.5px', color: 'var(--text-muted)' }}>
+                          {isLoadingLive
+                            ? '検索中...'
+                            : liveSearchQuery.trim()
+                              ? `「${liveSearchQuery.trim()}」で放送中 ${liveTotalCount.toLocaleString()}件`
+                              : `現在放送中 ${(liveTotalCount || livePrograms.length).toLocaleString()}件`}
+                        </span>
+                      </div>
+
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          const trimmed = liveSearchQuery.trim();
+                          const directLv = trimmed.match(/^(?:https?:\/\/live\.nicovideo\.jp\/watch\/)?(lv\d+)(?:[?#].*)?$/i);
+                          if (directLv) {
+                            const lvId = directLv[1].toLowerCase();
+                            void playLiveProgram({ id: lvId, url: `https://live.nicovideo.jp/watch/${lvId}` });
+                            return;
+                          }
+                          void loadNicoLivePrograms({ q: trimmed, sort: liveSearchSort, tab: liveCategoryTab });
+                        }}
+                        style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' }}
                       >
-                        一覧を更新
-                      </button>
-                    </form>
-                    <div style={{ marginBottom: '12px' }}>
-                      <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>現在放送中のニコニコ生放送（タップでアプリ内再生）</span>
+                        <div style={{ position: 'relative', flex: '1 1 240px', display: 'flex', alignItems: 'center' }}>
+                          <input
+                            type="text"
+                            className="zero-input"
+                            value={liveSearchQuery}
+                            onChange={(e) => setLiveSearchQuery(e.target.value)}
+                            placeholder="今やってるLIVEをキーワード検索（例: 雑談 / ゲーム / 歌枠 / マイクラ / 実況 / lv番号）"
+                            style={{ width: '100%', paddingRight: liveSearchQuery ? '34px' : undefined }}
+                          />
+                          {liveSearchQuery && (
+                            <button
+                              type="button"
+                              aria-label="LIVE検索文字をクリア"
+                              onClick={() => {
+                                setLiveSearchQuery('');
+                                void loadNicoLivePrograms({ q: '', sort: liveSearchSort, tab: liveCategoryTab });
+                              }}
+                              style={{
+                                position: 'absolute',
+                                right: '8px',
+                                background: 'none',
+                                border: 'none',
+                                color: 'var(--text-muted)',
+                                cursor: 'pointer',
+                                display: 'inline-flex',
+                                padding: '2px'
+                              }}
+                            >
+                              <span className="material-icons" style={{ fontSize: '17px' }}>close</span>
+                            </button>
+                          )}
+                        </div>
+                        <button type="submit" className="zero-primary-btn" disabled={isLoadingLive}>
+                          <span className="material-icons" style={{ fontSize: '17px' }}>search</span>
+                          <span>LIVE検索</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="zero-secondary-btn"
+                          onClick={() => void loadNicoLivePrograms()}
+                          disabled={isLoadingLive}
+                        >
+                          <span className={`material-icons ${isLoadingLive ? 'spin-icon' : ''}`} style={{ fontSize: '17px' }}>refresh</span>
+                          <span>更新</span>
+                        </button>
+                      </form>
+
+                      {/* Quick Live Keyword Chips */}
+                      <div className="zero-tabs-strip" style={{ marginBottom: '10px' }}>
+                        {[
+                          { label: 'すべて (人気順)', q: '' },
+                          { label: '雑談', q: '雑談' },
+                          { label: 'ゲーム', q: 'ゲーム' },
+                          { label: '歌枠', q: '歌' },
+                          { label: 'お絵描き', q: '絵' },
+                          { label: '外配信', q: '外配信' },
+                          { label: 'ニコニコ実況', q: 'ニコニコ実況' },
+                          { label: '競馬・麻雀', q: '麻雀' },
+                          { label: '作業', q: '作業' }
+                        ].map((chip) => {
+                          const isActive = liveSearchQuery.trim() === chip.q;
+                          return (
+                            <button
+                              key={chip.label}
+                              type="button"
+                              className={`zero-tab-btn ${isActive ? 'active' : ''}`}
+                              onClick={() => {
+                                setLiveSearchQuery(chip.q);
+                                void loadNicoLivePrograms({ q: chip.q, sort: liveSearchSort, tab: liveCategoryTab });
+                              }}
+                            >
+                              {chip.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Sort & Category Filter Row */}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                        {!liveSearchQuery.trim() ? (
+                          <div className="zero-tabs-strip">
+                            {[
+                              { id: 'all', label: '全ジャンル' },
+                              { id: 'common', label: '一般' },
+                              { id: 'game', label: 'ゲーム' },
+                              { id: 'try', label: 'やってみた' },
+                              { id: 'face', label: '顔出し' },
+                              { id: 'official', label: '公式' }
+                            ].map((cat) => (
+                              <button
+                                key={cat.id}
+                                type="button"
+                                className={`zero-tab-btn ${liveCategoryTab === cat.id ? 'active' : ''}`}
+                                onClick={() => {
+                                  const nextTab = cat.id as typeof liveCategoryTab;
+                                  setLiveCategoryTab(nextTab);
+                                  void loadNicoLivePrograms({ q: '', sort: liveSearchSort, tab: nextTab });
+                                }}
+                              >
+                                {cat.label}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                            現在放送中（ON_AIR）の番組のみを表示中
+                          </span>
+                        )}
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <label htmlFor="live-sort-select" style={{ fontSize: '12px', color: 'var(--text-muted)' }}>並び替え:</label>
+                          <select
+                            id="live-sort-select"
+                            value={liveSearchSort}
+                            onChange={(e) => {
+                              const nextSort = e.target.value as typeof liveSearchSort;
+                              setLiveSearchSort(nextSort);
+                              void loadNicoLivePrograms({ q: liveSearchQuery, sort: nextSort, tab: liveCategoryTab });
+                            }}
+                            className="zero-input"
+                            style={{ padding: '5px 10px', fontSize: '12px' }}
+                          >
+                            <option value="viewCountDesc">来場者数が多い順</option>
+                            <option value="commentCountDesc">コメントが多い順</option>
+                            <option value="recentDesc">配信開始が新しい順</option>
+                          </select>
+                        </div>
+                      </div>
                     </div>
+
+                    {liveSearchError && (
+                      <div style={{ padding: '10px 14px', borderRadius: '8px', background: 'rgba(220, 38, 38, 0.1)', border: '1px solid #dc2626', color: '#dc2626', fontSize: '13px' }}>
+                        {liveSearchError}
+                      </div>
+                    )}
+
                     {isLoadingLive ? (
                       <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
                         <span className="material-icons spin-icon" style={{ fontSize: '32px', color: 'var(--accent)' }}>sync</span>
-                        <p>生放送一覧を取得中...</p>
+                        <p>{liveSearchQuery.trim() ? `「${liveSearchQuery.trim()}」の放送中LIVEを検索中...` : '放送中のLIVE一覧を取得中...'}</p>
+                      </div>
+                    ) : livePrograms.length === 0 ? (
+                      <div className="zero-surface-box" style={{ textAlign: 'center', padding: '40px 20px' }}>
+                        <span className="material-icons" style={{ fontSize: '40px', color: 'var(--text-muted)', marginBottom: '8px' }}>live_tv</span>
+                        <h3 style={{ margin: '0 0 6px', fontSize: '16px' }}>
+                          {liveSearchQuery.trim()
+                            ? `「${liveSearchQuery.trim()}」で現在放送中のLIVEは見つかりませんでした`
+                            : '現在放送中のLIVEが見つかりませんでした'}
+                        </h3>
+                        <p style={{ margin: '0 0 14px', fontSize: '13px', color: 'var(--text-muted)' }}>
+                          別のキーワードを試すか、すべての放送中LIVE一覧を表示してください。
+                        </p>
+                        {liveSearchQuery.trim() && (
+                          <button
+                            type="button"
+                            className="zero-primary-btn"
+                            onClick={() => {
+                              setLiveSearchQuery('');
+                              void loadNicoLivePrograms({ q: '', sort: liveSearchSort, tab: liveCategoryTab });
+                            }}
+                          >
+                            すべての放送中LIVEを表示
+                          </button>
+                        )}
                       </div>
                     ) : (
                       <div className="video-grid">
-                        {livePrograms.map((p) => (
-                          <div
-                            key={p.id}
-                            className="video-card-grid"
-                            onClick={() => void playLiveProgram(p)}
-                          >
-                            <div className="video-card-thumb-wrap">
-                              <img src={p.thumbnail} alt={p.title} loading="lazy" referrerPolicy="no-referrer" />
-                              <span className="video-rank-tag top3">
-                                LIVE
-                              </span>
+                        {livePrograms.map((p) => {
+                          const elapsed = formatLiveElapsed(p.beginTime);
+                          return (
+                            <div
+                              key={p.id}
+                              className="video-card-grid"
+                              onClick={() => void playLiveProgram(p)}
+                            >
+                              <div className="video-card-thumb-wrap">
+                                <img src={p.thumbnail} alt={p.title} loading="lazy" referrerPolicy="no-referrer" />
+                                <span className="video-rank-tag top3">
+                                  LIVE
+                                </span>
+                                {elapsed && (
+                                  <span className="video-duration-tag">
+                                    {elapsed}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="video-card-body">
+                                <h3>{p.title}</h3>
+                                <p>{p.providerName} · 来場 {p.watchCount.toLocaleString()} · コメ {p.commentCount.toLocaleString()}</p>
+                              </div>
                             </div>
-                            <div className="video-card-body">
-                              <h3>{p.title}</h3>
-                              <p>{p.providerName} · 来場 {p.watchCount.toLocaleString()} · コメ {p.commentCount.toLocaleString()}</p>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>

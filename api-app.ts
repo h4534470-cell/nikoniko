@@ -3783,32 +3783,138 @@ export function createApiApp(): express.Express {
     }
   });
 
-  app.get('/api/nico/live', async (req, res) => {
-    const sortOrder = String(req.query.sort || 'viewCount');
+  const handleNicoLiveSearch = async (req: express.Request, res: express.Response) => {
+    const q = String(req.query.q || '').trim();
+    const sortRaw = String(req.query.sort || 'viewCountDesc');
+    const tabRaw = String(req.query.tab || 'all').toLowerCase();
+    const offset = Math.max(0, parseInt(String(req.query.offset || '0'), 10) || 0);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || (q ? '40' : '100')), 10) || 40));
+
     try {
+      // Direct lv ID lookup if query contains lv\d+
+      const lvMatch = q.match(/\b(lv\d+)\b/i);
+      if (lvMatch && /^lv\d+$/i.test(q.replace(/^https?:\/\/[^/]+\/watch\//i, '').split(/[?#]/)[0].trim())) {
+        const cleanId = lvMatch[1].toLowerCase();
+        try {
+          const r = await fetch(`https://live.nicovideo.jp/watch/${encodeURIComponent(cleanId)}`, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
+            },
+            signal: AbortSignal.timeout(6000)
+          });
+          if (r.ok) {
+            const html = await r.text();
+            const m = html.match(/id="embedded-data"[^>]*data-props="([^"]+)"/) || html.match(/data-props="([^"]+)"[^>]*id="embedded-data"/);
+            if (m) {
+              const props = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+              const prog = props.program || {};
+              const status = String(prog.status || '');
+              const items = status === 'ON_AIR'
+                ? [{
+                    id: cleanId,
+                    title: String(prog.title || `ニコニコ生放送 (${cleanId})`),
+                    thumbnail: String(prog.thumbnail?.largeUrl || prog.thumbnail?.smallUrl || ''),
+                    url: `https://live.nicovideo.jp/watch/${cleanId}`,
+                    providerName: String(prog.supplier?.name || props.user?.nickname || '放送主'),
+                    providerAvatar: String(prog.supplier?.icons?.uri50x50 || ''),
+                    providerId: String(prog.supplier?.programProviderId || ''),
+                    providerType: String(prog.providerType || ''),
+                    watchCount: Number(prog.statistics?.watchCount || 0),
+                    commentCount: Number(prog.statistics?.commentCount || 0),
+                    liveCycle: 'ON_AIR',
+                    beginTime: Number(prog.beginTime || 0)
+                  }]
+                : [];
+              return res.json({ success: true, items, total: items.length, keyword: q, status });
+            }
+          }
+        } catch {}
+      }
+
+      if (q) {
+        const searchSort =
+          sortRaw === 'commentCountDesc' || sortRaw === 'commentCount'
+            ? 'commentCountDesc'
+            : sortRaw === 'recentDesc' || sortRaw === 'recent'
+              ? 'recentDesc'
+              : 'viewCountDesc';
+        const url = `https://live.nicovideo.jp/front/api/pages/search/v1/programs?keyword=${encodeURIComponent(q)}&status=onair&sortOrder=${encodeURIComponent(searchSort)}&offset=${offset}&limit=${limit}`;
+        const resp = await fetch(url, { headers: NICO_API_HEADERS, signal: AbortSignal.timeout(6000) });
+        if (!resp.ok) return res.status(resp.status).json({ success: false, items: [] });
+        const json = await resp.json();
+        const rawPrograms: any[] = Array.isArray(json?.data?.programs) ? json.data.programs : [];
+        const items = rawPrograms
+          .filter((p) => !p?.status || String(p.status).toUpperCase() === 'ON_AIR')
+          .map((p: any) => {
+            const pid = String(p.nicoliveProgramId || p.id || '').toLowerCase();
+            return {
+              id: pid,
+              title: String(p.title || '生放送'),
+              thumbnail: String(p.listingThumbnail || ''),
+              url: String(p.watchPageUrl || `https://live.nicovideo.jp/watch/${pid}`).split('?')[0],
+              providerName: String(p.programProvider?.name || p.supplier?.name || p.socialGroup?.name || '放送主'),
+              providerAvatar: String(p.programProvider?.icon || p.socialGroup?.thumbnailUrl || ''),
+              providerId: String(p.programProvider?.id || p.socialGroup?.id || ''),
+              providerType: String(p.providerType || ''),
+              watchCount: Number(p.statistics?.watchCount || 0),
+              commentCount: Number(p.statistics?.commentCount || 0),
+              liveCycle: 'ON_AIR',
+              beginTime: Number(p.beginTime || 0)
+            };
+          })
+          .filter((p) => Boolean(p.id));
+        return res.json({
+          success: true,
+          items,
+          total: Number(json?.data?.totalCount ?? items.length),
+          keyword: q
+        });
+      }
+
+      const recentSort =
+        sortRaw === 'commentCountDesc' || sortRaw === 'commentCount'
+          ? 'commentCount'
+          : sortRaw === 'recentDesc' || sortRaw === 'recent'
+            ? 'recent'
+            : 'viewCount';
+      const validTabs = new Set(['common', 'game', 'try', 'official', 'face']);
+      const tabParam = validTabs.has(tabRaw) ? `&tab=${encodeURIComponent(tabRaw)}` : '';
       const resp = await fetch(
-        `https://live.nicovideo.jp/front/api/pages/recent/v1/programs?offset=0&limit=100&sortOrder=${encodeURIComponent(sortOrder)}`,
+        `https://live.nicovideo.jp/front/api/pages/recent/v1/programs?offset=${offset}&limit=${limit}&sortOrder=${encodeURIComponent(recentSort)}${tabParam}`,
         { headers: NICO_API_HEADERS, signal: AbortSignal.timeout(6000) }
       );
       if (!resp.ok) return res.status(resp.status).json({ success: false, items: [] });
       const json = await resp.json();
-      const items = (json?.data || []).map((p: any) => ({
-        id: String(p.id),
-        title: String(p.title || '生放送'),
-        thumbnail: String(p.listingThumbnail || ''),
-        url: String(p.watchPageUrl || `https://live.nicovideo.jp/watch/${p.id}`).split('?')[0],
-        providerName: String(p.programProvider?.name || '放送主'),
-        providerAvatar: String(p.programProvider?.icon || ''),
-        providerId: String(p.programProvider?.id || ''),
-        watchCount: Number(p.statistics?.watchCount || 0),
-        commentCount: Number(p.statistics?.commentCount || 0),
-        liveCycle: String(p.liveCycle || 'ON_AIR')
-      }));
-      return res.json({ success: true, items, total: Number(json?.meta?.totalCount || items.length) });
+      const items = (json?.data || [])
+        .filter((p: any) => !p?.liveCycle || String(p.liveCycle).toUpperCase() === 'ON_AIR')
+        .map((p: any) => ({
+          id: String(p.id).toLowerCase(),
+          title: String(p.title || '生放送'),
+          thumbnail: String(p.listingThumbnail || ''),
+          url: String(p.watchPageUrl || `https://live.nicovideo.jp/watch/${p.id}`).split('?')[0],
+          providerName: String(p.programProvider?.name || '放送主'),
+          providerAvatar: String(p.programProvider?.icon || ''),
+          providerId: String(p.programProvider?.id || ''),
+          providerType: String(p.providerType || ''),
+          watchCount: Number(p.statistics?.watchCount || 0),
+          commentCount: Number(p.statistics?.commentCount || 0),
+          liveCycle: String(p.liveCycle || 'ON_AIR'),
+          beginTime: Number(p.beginTime || 0)
+        }));
+      return res.json({
+        success: true,
+        items,
+        total: Number(json?.meta?.totalCount || items.length),
+        keyword: ''
+      });
     } catch (err: any) {
-      return res.status(502).json({ success: false, items: [], error: err?.message });
+      return res.status(502).json({ success: false, items: [], error: err?.message || 'Live search failed' });
     }
-  });
+  };
+
+  app.get('/api/nico/live', handleNicoLiveSearch);
+  app.get('/api/nico/live/search', handleNicoLiveSearch);
 
   const userLiveCheckCache = new Map<string, { checkedAt: number; live: any | null }>();
 
