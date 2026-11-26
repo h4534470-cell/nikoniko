@@ -1,0 +1,6 @@
+{
+  "name": "muraにこ動画",
+  "description": "ニコニコ動画の動画検索・再生・弾幕コメント・プレイリスト・レビューに対応した動画クライアント",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
