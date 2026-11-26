@@ -184,6 +184,17 @@ export function createApiApp(): express.Express {
     next();
   });
 
+  app.get('/api/health', (_req, res) => {
+    return res.json({
+      ok: true,
+      status: 'ok',
+      search: 'ready',
+      ytDlp: fs.existsSync(YT_DLP_BIN),
+      ffmpeg: hasFfmpeg(),
+      vercel: IS_VERCEL
+    });
+  });
+
   // Real Live Search Engine Helpers (Niconico Snapshot API v2 + YouTube Live Search)
   function formatSecToDuration(sec: number): string {
     const total = Math.max(0, Math.floor(Number(sec) || 0));
@@ -2275,7 +2286,7 @@ export function createApiApp(): express.Express {
       channel: 'Official髭男dism',
       channel_url: 'https://www.nicovideo.jp/watch/sm40320938',
       channelAvatar: 'https://img.nicoprofile.nimg.jp/usericon/defaults/blank.jpg',
-      thumbnail: 'https://nicovideo.cdn.nimg.jp/thumbnails/40320938/40320938',
+      thumbnail: 'https://nicovideo.cdn.nimg.jp/thumbnails/40320938/40320938.84330666',
       duration: '03:49',
       views: 4829100,
       url: 'https://www.nicovideo.jp/watch/sm40320938',

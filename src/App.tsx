@@ -619,11 +619,17 @@ export default function App() {
         const resp = await fetch(
           `/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}`
         );
-        const data = await resp.json();
+        const rawText = await resp.text();
+        let data: any = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          data = null;
+        }
         if (cancelled) return;
 
-        if (!data.ok || !data.streamUrl) {
-          throw new Error(data.error || 'Freemakeストリームの取得に失敗しました');
+        if (!resp.ok || !data?.ok || !data?.streamUrl) {
+          throw new Error(data?.error || `ストリーム取得に失敗しました (HTTP ${resp.status})`);
         }
 
         setFreemakeStreamType(data.mode || 'proxy');

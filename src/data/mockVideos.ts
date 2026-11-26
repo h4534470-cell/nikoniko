@@ -7,7 +7,7 @@ export const INITIAL_VIDEOS: Video[] = [
     "channel": "Official髭男dism",
     "channel_url": "https://www.nicovideo.jp/watch/sm40320938",
     "channelAvatar": "https://img.nicoprofile.nimg.jp/usericon/defaults/blank.jpg",
-    "thumbnail": "https://nicovideo.cdn.nimg.jp/thumbnails/40320938/40320938",
+    "thumbnail": "https://nicovideo.cdn.nimg.jp/thumbnails/40320938/40320938.84330666",
     "duration": "3:49",
     "views": 4829100,
     "url": "https://www.nicovideo.jp/watch/sm40320938",
