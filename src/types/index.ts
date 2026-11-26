@@ -32,6 +32,7 @@ export interface Video {
   tags?: VideoTag[];
   series?: { id: number; title: string } | null;
   initialDanmaku?: string[];
+  isLive?: boolean;
 }
 
 export interface CommentReply {
@@ -88,9 +89,38 @@ export interface ChannelSubscription {
   url: string;
   name: string;
   avatar?: string;
+  userId?: string;
   subscriberCount?: number;
   videoCount?: number;
   description?: string;
+}
+
+export interface LiveProgram {
+  id: string;
+  title: string;
+  thumbnail: string;
+  url: string;
+  providerName: string;
+  providerAvatar: string;
+  providerId?: string;
+  watchCount: number;
+  commentCount: number;
+  liveCycle?: string;
+  matchedSubUrl?: string;
+  matchedSubName?: string;
+}
+
+export interface LiveChatComment {
+  id: string;
+  no?: number;
+  text: string;
+  name?: string;
+  userId?: string;
+  color?: string;
+  position?: 'ue' | 'shita' | 'naka';
+  size?: 'big' | 'small' | 'medium';
+  atMs: number;
+  isSystem?: boolean;
 }
 
 export interface AppSettings {

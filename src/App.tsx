@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Hls from 'hls.js';
-import { Video, ViewType, Review, ChannelSubscription, Playlist, NicoComment } from './types';
+import { Video, ViewType, Review, ChannelSubscription, Playlist, NicoComment, LiveProgram, LiveChatComment } from './types';
 import { INITIAL_VIDEOS, INITIAL_REVIEWS } from './data/mockVideos';
+import { downloadNiconicoInBrowser } from './utils/nicoDownload';
 import {
   safeStorage,
   getPlayHistory,
@@ -19,7 +20,6 @@ import {
   getSettings,
   saveSettings,
   getVideoDanmaku,
-  getVisitCount,
   getSavedCustomVideos,
   saveCustomVideo,
   getSearchHistory,
@@ -36,32 +36,10 @@ interface ActiveDanmakuItem {
   key: string;
 }
 
-const ANNOUNCEMENTS = [
-  {
-    id: 'ann-1',
-    date: '2026/03/15',
-    title: 'muraにこ動画へようこそ！',
-    body: 'ニコニコ動画の動画検索・再生・弾幕コメント表示・保存に完全対応しました。'
-  },
-  {
-    id: 'ann-2',
-    date: '2026/03/01',
-    title: 'ミニプレイヤー＆バックグラウンド再生機能を追加',
-    body: '動画再生中に他のページ（履歴・ライブラリ・設定など）へ移動しても、画面右下のミニプレイヤーで継続して動画を視聴できるようになりました。'
-  },
-  {
-    id: 'ann-3',
-    date: '2026/02/20',
-    title: 'リアルタイム弾幕コメント投稿に対応',
-    body: '動画再生画面から自分でも弾幕コメントを直接送信できるようになりました。'
-  }
-];
-
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewType>('home');
   const [sidebarHidden, setSidebarHidden] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [visitCount, setVisitCount] = useState<number>(12845);
   const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
   const [guestName, setGuestName] = useState<string>(() => safeStorage.getItem('zeroGuestName') || '');
   const [guestNameDraft, setGuestNameDraft] = useState<string>(() => safeStorage.getItem('zeroGuestName') || '');
@@ -127,6 +105,9 @@ export default function App() {
     commentCount: number;
   }>>([]);
   const [isLoadingLive, setIsLoadingLive] = useState<boolean>(false);
+  const [liveIdInput, setLiveIdInput] = useState<string>('');
+  const [favoriteLiveAlerts, setFavoriteLiveAlerts] = useState<LiveProgram[]>([]);
+  const [liveAlertsDismissed, setLiveAlertsDismissed] = useState<boolean>(false);
   const [seigaInput, setSeigaInput] = useState<string>('im10000000');
   const [seigaResult, setSeigaResult] = useState<any>(null);
   const [seigaLoading, setSeigaLoading] = useState<boolean>(false);
@@ -149,6 +130,7 @@ export default function App() {
 
   // Player mode ('freemake' real-time yt-dlp/HLS stream, 'embed' official iframe, 'custom' cached MP4)
   const [playerMode, setPlayerMode] = useState<'freemake' | 'embed' | 'custom'>('freemake');
+  const [radioMode, setRadioMode] = useState<boolean>(() => safeStorage.getItem('zeroRadioMode') === 'on');
   const [freemakeQuality, setFreemakeQuality] = useState<string>('720');
   const [freemakeStreamType, setFreemakeStreamType] = useState<'hls' | 'proxy' | 'remux' | null>(null);
   const [freemakeResolvedUrl, setFreemakeResolvedUrl] = useState<string | null>(null);
@@ -243,7 +225,11 @@ export default function App() {
   };
 
   const getEmbedUrl = (v: Video) => {
-    return `https://embed.nicovideo.jp/watch/${encodeURIComponent(v.nicoId || v.id)}`;
+    const vid = v.nicoId || v.id;
+    if (v.isLive || /^lv\d+$/i.test(vid)) {
+      return `https://live.nicovideo.jp/embed/${encodeURIComponent(vid)}`;
+    }
+    return `https://embed.nicovideo.jp/watch/${encodeURIComponent(vid)}`;
   };
 
   const switchPlayerMode = (mode: 'freemake' | 'embed' | 'custom') => {
@@ -252,38 +238,81 @@ export default function App() {
     safeStorage.setItem('playerModePreference', mode);
 
     if (mode === 'embed') {
+      loadedStreamKeyRef.current = '';
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+      }
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.removeAttribute('src');
+      }
       setIsVideoLoading(false);
       setVideoLoadingPercent(100);
       return;
     }
 
     if (mode === 'freemake') {
+      loadedStreamKeyRef.current = '';
       setIsVideoLoading(true);
       setVideoLoadingPercent(25);
-      setVideoLoadingStage('Freemake ストリームを解析中...');
+      setVideoLoadingStage(radioMode ? 'ラジオ用音声ストリームを解析中...' : 'Freemake ストリームを解析中...');
       return;
     }
 
+    loadedStreamKeyRef.current = '';
     setIsVideoLoading(false);
     setVideoLoadingPercent(100);
 
-    if (mode === 'custom' && currentVideo && videoRef.current) {
+    const activeEl = getActiveMediaEl();
+    if (mode === 'custom' && currentVideo && activeEl) {
       const streamUrl = getStreamUrl(currentVideo);
-      if (!videoRef.current.src.endsWith(streamUrl)) {
-        videoRef.current.src = streamUrl;
-        videoRef.current.load();
+      if (!activeEl.src.endsWith(streamUrl)) {
+        activeEl.src = streamUrl;
+        activeEl.load();
       }
       setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.play().catch(() => {
-            if (videoRef.current) {
-              videoRef.current.muted = true;
-              videoRef.current.play().catch(() => {});
-            }
+        const el = getActiveMediaEl();
+        if (el) {
+          el.play().catch(() => {
+            el.muted = true;
+            el.play().catch(() => {});
           });
         }
       }, 50);
     }
+  };
+
+  const toggleRadioMode = () => {
+    const next = !radioMode;
+    loadedStreamKeyRef.current = '';
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.removeAttribute('src');
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.removeAttribute('src');
+    }
+    setRadioMode(next);
+    safeStorage.setItem('zeroRadioMode', next ? 'on' : 'off');
+    if (next && playerMode === 'embed') {
+      setPlayerMode('freemake');
+      safeStorage.setItem('playerModePreference', 'freemake');
+    }
+    showPlayerNotification(
+      next
+        ? 'ラジオモード（音声のみ・省データ）に切り替えました'
+        : '通常プレイヤー（映像＋音声）に戻しました'
+    );
   };
 
   // Player controls
@@ -293,6 +322,15 @@ export default function App() {
   const [descExpanded, setDescExpanded] = useState<boolean>(false);
   const [activeDanmaku, setActiveDanmaku] = useState<ActiveDanmakuItem[]>([]);
   const [danmakuPool, setDanmakuPool] = useState<NicoComment[]>([]);
+  const [liveComments, setLiveComments] = useState<LiveChatComment[]>([]);
+  const [liveCommentsLoading, setLiveCommentsLoading] = useState<boolean>(false);
+  const seenLiveCommentIdsRef = useRef<Set<string>>(new Set());
+  const liveCommentsCursorRef = useRef<number>(0);
+  const liveChatListRef = useRef<HTMLDivElement | null>(null);
+  const nicoCommentsOnRef = useRef<boolean>(nicoCommentsOn);
+  const radioModeRef = useRef<boolean>(radioMode);
+  useEffect(() => { nicoCommentsOnRef.current = nicoCommentsOn; }, [nicoCommentsOn]);
+  useEffect(() => { radioModeRef.current = radioMode; }, [radioMode]);
   const [floatingPlayerVisible, setFloatingPlayerVisible] = useState<boolean>(false);
 
   // Library & Playlists
@@ -300,9 +338,6 @@ export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [selectedPlaylistIndex, setSelectedPlaylistIndex] = useState<number | null>(null);
   const [isPlaylistDialogOpen, setIsPlaylistDialogOpen] = useState<boolean>(false);
-
-  // Announcements
-  const [isAnnouncementsOpen, setIsAnnouncementsOpen] = useState<boolean>(false);
 
   // Reviews
   const [reviews, setReviews] = useState<Review[]>([]);
@@ -370,22 +405,70 @@ export default function App() {
 
   useEffect(() => {
     try {
-      safeStorage.setItem('dlRecentJobs', JSON.stringify(dlRecentJobs));
+      const persistable = dlRecentJobs.filter((j) => !j.fileUrl.startsWith('blob:'));
+      safeStorage.setItem('dlRecentJobs', JSON.stringify(persistable));
     } catch {}
   }, [dlRecentJobs]);
 
   // Refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const floatingVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoContainerRef = useRef<HTMLDivElement | null>(null);
   const danmakuTimerRef = useRef<Set<string>>(new Set());
   const dlIntervalRef = useRef<number | null>(null);
+  const dlAbortRef = useRef<AbortController | null>(null);
   const videoRetryCountRef = useRef<number>(0);
   const hlsRef = useRef<Hls | null>(null);
+  const loadedStreamKeyRef = useRef<string>('');
+  const prevAlertIdsRef = useRef<string>('');
 
-  // Real-time stream attachment for Freemake (HLS / Range Proxy / ffmpeg) & Custom HTML5 player
+  const getActiveMediaEl = (): HTMLMediaElement | null => {
+    if (radioMode && playerMode !== 'embed') {
+      return audioRef.current;
+    }
+    return videoRef.current;
+  };
+
+  // Sync Media Session metadata and lock-screen/background playback controls
   useEffect(() => {
-    if ((playerMode !== 'custom' && playerMode !== 'freemake') || !currentVideo || currentView !== 'player') {
+    if (!('mediaSession' in navigator) || !currentVideo) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentVideo.title || 'ZERO-ニコ動',
+        artist: currentVideo.channel || 'ニコニコ動画',
+        album: radioMode ? 'ZERO-ニコ動 ラジオモード' : 'ZERO-ニコ動',
+        artwork: currentVideo.thumbnail
+          ? [
+              { src: currentVideo.thumbnail, sizes: '320x180', type: 'image/jpeg' },
+              { src: currentVideo.thumbnail, sizes: '640x360', type: 'image/jpeg' }
+            ]
+          : []
+      });
+      navigator.mediaSession.playbackState = isVideoPlaying ? 'playing' : 'paused';
+      navigator.mediaSession.setActionHandler('play', () => {
+        const el = getActiveMediaEl();
+        el?.play().catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler('pause', () => {
+        const el = getActiveMediaEl();
+        el?.pause();
+      });
+      navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+        const el = getActiveMediaEl();
+        if (el) el.currentTime = Math.max(0, el.currentTime - (details.seekOffset || 10));
+      });
+      navigator.mediaSession.setActionHandler('seekforward', (details) => {
+        const el = getActiveMediaEl();
+        if (el) el.currentTime = Math.min(el.duration || el.currentTime + 10, el.currentTime + (details.seekOffset || 10));
+      });
+    } catch {}
+  }, [currentVideo?.id, currentVideo?.title, currentVideo?.channel, currentVideo?.thumbnail, isVideoPlaying, radioMode, playerMode]);
+
+  // Real-time stream attachment for Freemake (HLS / Range Proxy / ffmpeg) & Custom HTML5 player (supports Video & Radio Audio-Only)
+  useEffect(() => {
+    if ((playerMode !== 'custom' && playerMode !== 'freemake') || !currentVideo) {
+      loadedStreamKeyRef.current = '';
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -393,9 +476,37 @@ export default function App() {
       return;
     }
 
-    const videoEl = videoRef.current;
-    if (!videoEl) return;
+    const desiredKey = `${currentVideo.id}::${playerMode}::${freemakeQuality}::${radioMode ? 'audio' : 'video'}`;
 
+    if (currentView !== 'player') {
+      // Keep radio audio or floating player alive when navigating to other views
+      if (loadedStreamKeyRef.current === desiredKey && (radioMode || floatingPlayerVisible)) {
+        return;
+      }
+      if (!radioMode) {
+        loadedStreamKeyRef.current = '';
+        if (hlsRef.current) {
+          hlsRef.current.destroy();
+          hlsRef.current = null;
+        }
+      }
+      return;
+    }
+
+    const mediaEl = radioMode ? audioRef.current : videoRef.current;
+    const inactiveEl = radioMode ? videoRef.current : audioRef.current;
+    if (inactiveEl) {
+      inactiveEl.pause();
+      inactiveEl.removeAttribute('src');
+    }
+    if (!mediaEl) return;
+
+    // Avoid reloading an already-active stream when returning from another view
+    if (loadedStreamKeyRef.current === desiredKey && (hlsRef.current || mediaEl.currentSrc || mediaEl.src)) {
+      return;
+    }
+
+    loadedStreamKeyRef.current = desiredKey;
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
@@ -403,10 +514,10 @@ export default function App() {
 
     if (playerMode === 'custom') {
       const directStreamUrl = getStreamUrl(currentVideo);
-      if (!videoEl.src.endsWith(directStreamUrl)) {
-        videoEl.src = directStreamUrl;
+      if (!mediaEl.src.endsWith(directStreamUrl)) {
+        mediaEl.src = directStreamUrl;
       }
-      const playPromise = videoEl.play();
+      const playPromise = mediaEl.play();
       if (playPromise !== undefined) {
         playPromise
           .then(() => setIsVideoPlaying(true))
@@ -415,25 +526,98 @@ export default function App() {
       return;
     }
 
-    // Freemake Real-Time Stream Mode
+    // Freemake Real-Time Stream Mode (or Radio Audio-Only Mode)
     let cancelled = false;
+    let stallTimer: number | null = null;
+    const isNicoTarget = Boolean(
+      currentVideo.isLive ||
+      /^(sm|so|nm|lv)\d+$/i.test(currentVideo.nicoId || currentVideo.id) ||
+      (currentVideo.url && currentVideo.url.includes('nicovideo.jp'))
+    );
     const targetUrl =
       currentVideo.url ||
       (currentVideo.nicoId
-        ? `https://www.nicovideo.jp/watch/${currentVideo.nicoId}`
+        ? (currentVideo.isLive || /^lv\d+$/i.test(currentVideo.nicoId)
+            ? `https://live.nicovideo.jp/watch/${currentVideo.nicoId}`
+            : `https://www.nicovideo.jp/watch/${currentVideo.nicoId}`)
         : currentVideo.id);
 
     setIsVideoLoading(true);
     setVideoError(null);
     setVideoLoadingPercent(30);
-    setVideoLoadingStage(`Freemake ストリーム接続中 (${freemakeQuality}p)...`);
+    setVideoLoadingStage(
+      radioMode
+        ? 'ラジオ音声ストリームへ接続中...'
+        : currentVideo.isLive
+          ? '生放送ストリームへ接続中...'
+          : `Freemake ストリーム接続中 (${freemakeQuality}p)...`
+    );
     setFreemakeStreamType(null);
     setFreemakeResolvedUrl(null);
+
+    const clearStallTimer = () => {
+      if (stallTimer !== null) {
+        window.clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    };
+
+    const startMetadataWatchdog = () => {
+      clearStallTimer();
+      stallTimer = window.setTimeout(() => {
+        if (cancelled) return;
+        const m = radioMode ? audioRef.current : videoRef.current;
+        if (!m || m.readyState < 1) {
+          if (hlsRef.current) {
+            hlsRef.current.destroy();
+            hlsRef.current = null;
+          }
+          setIsVideoLoading(false);
+          if (isNicoTarget && !radioMode) {
+            setPlayerMode('embed');
+            showPlayerNotification('ストリーム読み込みに時間がかかったため、公式プレイヤーへ切り替えました');
+          } else {
+            setVideoError('ストリームの読み込みがタイムアウトしました。再度お試しください。');
+          }
+        }
+      }, 10000);
+    };
+
+    const trySafePlay = (el: HTMLMediaElement) => {
+      el.play()
+        .then(() => {
+          if (cancelled) return;
+          setIsVideoPlaying(true);
+          setIsVideoLoading(false);
+          setVideoLoadingPercent(100);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          if (!radioMode) {
+            el.muted = true;
+            el.play()
+              .then(() => {
+                if (cancelled) return;
+                setIsVideoPlaying(true);
+                setIsVideoLoading(false);
+                setVideoLoadingPercent(100);
+              })
+              .catch(() => {
+                if (cancelled) return;
+                setIsVideoLoading(false);
+                setIsVideoPlaying(false);
+              });
+          } else {
+            setIsVideoLoading(false);
+            setIsVideoPlaying(false);
+          }
+        });
+    };
 
     (async () => {
       try {
         const resp = await fetch(
-          `/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}`
+          `/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}`
         );
         const data = await resp.json();
         if (cancelled) return;
@@ -446,73 +630,73 @@ export default function App() {
         setFreemakeResolvedUrl(data.streamUrl);
         setVideoLoadingPercent(85);
         setVideoLoadingStage('再生バッファを開始中...');
+        startMetadataWatchdog();
 
         const isHls = data.mode === 'hls' || String(data.streamUrl).includes('.m3u8');
         if (isHls) {
-          if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-            videoEl.src = data.streamUrl;
-            videoEl.play().then(() => {
-              setIsVideoPlaying(true);
-              setIsVideoLoading(false);
-              setVideoLoadingPercent(100);
-            }).catch(() => {
-              setIsVideoLoading(false);
-              setIsVideoPlaying(false);
-            });
-          } else if (Hls.isSupported()) {
+          if (Hls.isSupported()) {
+            const hasNativeMSE = typeof window !== 'undefined' && 'MediaSource' in window;
+            if (!hasNativeMSE && 'ManagedMediaSource' in window && 'disableRemotePlayback' in mediaEl) {
+              (mediaEl as HTMLVideoElement).disableRemotePlayback = true;
+            }
             const hls = new Hls({
-              enableWorker: true,
-              lowLatencyMode: false,
-              maxBufferLength: 30
+              enableWorker: hasNativeMSE,
+              lowLatencyMode: Boolean(currentVideo.isLive),
+              maxBufferLength: 25
             });
             hlsRef.current = hls;
             hls.loadSource(data.streamUrl);
-            hls.attachMedia(videoEl);
+            hls.attachMedia(mediaEl);
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
               if (cancelled) return;
               setVideoLoadingPercent(100);
               setIsVideoLoading(false);
-              videoEl.play().then(() => setIsVideoPlaying(true)).catch(() => {
-                videoEl.muted = true;
-                videoEl.play().then(() => setIsVideoPlaying(true)).catch(() => {});
-              });
+              trySafePlay(mediaEl);
             });
             hls.on(Hls.Events.ERROR, (_event, errData) => {
-              if (errData.fatal) {
+              if (errData.fatal && !cancelled) {
+                clearStallTimer();
+                hls.destroy();
+                hlsRef.current = null;
                 setIsVideoLoading(false);
-                setVideoError('HLSストリームの読み込みに失敗しました。公式プレイヤーでお試しください。');
+                if (isNicoTarget && !radioMode) {
+                  setPlayerMode('embed');
+                  showPlayerNotification('公式プレイヤーで再生します');
+                } else {
+                  setVideoError('音声・HLSストリームの読み込みに失敗しました。');
+                }
               }
             });
+          } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
+            mediaEl.src = data.streamUrl;
+            trySafePlay(mediaEl);
           } else {
-            videoEl.src = data.streamUrl;
+            mediaEl.src = data.streamUrl;
+            trySafePlay(mediaEl);
           }
         } else {
-          videoEl.src = data.streamUrl;
-          videoEl.load();
-          videoEl.play().then(() => {
-            setIsVideoPlaying(true);
-            setIsVideoLoading(false);
-            setVideoLoadingPercent(100);
-          }).catch(() => {
-            setIsVideoLoading(false);
-            setIsVideoPlaying(false);
-          });
+          mediaEl.src = data.streamUrl;
+          mediaEl.load();
+          trySafePlay(mediaEl);
         }
       } catch (err: any) {
         if (cancelled) return;
+        clearStallTimer();
         setIsVideoLoading(false);
-        setVideoError(err?.message || 'ストリームの取得に失敗しました');
+        if (isNicoTarget && currentVideo.isLive && !radioMode) {
+          setPlayerMode('embed');
+          showPlayerNotification('公式生放送プレイヤーへ切り替えました');
+        } else {
+          setVideoError(err?.message || 'ストリームの取得に失敗しました');
+        }
       }
     })();
 
     return () => {
       cancelled = true;
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
+      clearStallTimer();
     };
-  }, [playerMode, currentVideo?.id, currentView, freemakeQuality]);
+  }, [playerMode, currentVideo?.id, currentView, freemakeQuality, radioMode]);
 
   useEffect(() => {
     if (themeMode === 'dark') {
@@ -524,7 +708,6 @@ export default function App() {
   }, [themeMode]);
 
   useEffect(() => {
-    setVisitCount(getVisitCount());
     setPlayHistory(getPlayHistory());
     setSubscriptions(getSubscriptions());
     setPlaylists(getPlaylists());
@@ -566,6 +749,41 @@ export default function App() {
     fetchRanking('all', '24h');
   }, []);
 
+  const checkFavoriteLiveAlerts = async (subsList: ChannelSubscription[]) => {
+    if (!subsList || subsList.length === 0) {
+      setFavoriteLiveAlerts([]);
+      return;
+    }
+    try {
+      const res = await fetch('/api/nico/live/check-favorites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscriptions: subsList })
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.liveAlerts)) {
+        const nextIds = data.liveAlerts.map((a: LiveProgram) => a.id).sort().join(',');
+        if (nextIds && nextIds !== prevAlertIdsRef.current) {
+          setLiveAlertsDismissed(false);
+        }
+        prevAlertIdsRef.current = nextIds;
+        setFavoriteLiveAlerts(data.liveAlerts);
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (subscriptions.length === 0) {
+      setFavoriteLiveAlerts([]);
+      return;
+    }
+    void checkFavoriteLiveAlerts(subscriptions);
+    const timer = window.setInterval(() => {
+      void checkFavoriteLiveAlerts(subscriptions);
+    }, 60000);
+    return () => window.clearInterval(timer);
+  }, [subscriptions]);
+
   const loadNicoLivePrograms = async () => {
     setIsLoadingLive(true);
     try {
@@ -577,6 +795,57 @@ export default function App() {
     } catch {} finally {
       setIsLoadingLive(false);
     }
+  };
+
+  const playLiveProgram = async (p: {
+    id: string;
+    title?: string;
+    thumbnail?: string;
+    url?: string;
+    providerName?: string;
+    providerAvatar?: string;
+    watchCount?: number;
+    commentCount?: number;
+  }) => {
+    const cleanId = p.id.toLowerCase();
+    const initialVideo: Video = {
+      id: cleanId,
+      nicoId: cleanId,
+      isLive: true,
+      title: p.title || `ニコニコ生放送 (${cleanId})`,
+      channel: p.providerName || 'ニコニコ生放送',
+      channelAvatar: p.providerAvatar || '',
+      channel_url: `https://live.nicovideo.jp/watch/${cleanId}`,
+      thumbnail: p.thumbnail || '',
+      duration: 'LIVE',
+      views: Number(p.watchCount || 0),
+      commentCount: Number(p.commentCount || 0),
+      url: p.url || `https://live.nicovideo.jp/watch/${cleanId}`,
+      platform: 'niconico',
+      category: '生放送',
+      description: 'ニコニコ生放送のリアルタイム配信です。上の切り替えボタンで「公式生放送プレイヤー」と「ライブHLS再生」を切り替えられます。'
+    };
+    playVideo(initialVideo, 'freemake');
+    try {
+      const res = await fetch(`/api/nico/live/info/${encodeURIComponent(cleanId)}`);
+      const data = await res.json();
+      if (data.success && data.program) {
+        const prog = data.program;
+        setCurrentVideo((prev) => {
+          if (!prev || prev.id !== cleanId) return prev;
+          return {
+            ...prev,
+            title: prog.title || prev.title,
+            channel: prog.providerName || prev.channel,
+            channelAvatar: prog.providerAvatar || prev.channelAvatar,
+            thumbnail: prog.thumbnail || prev.thumbnail,
+            views: Number(prog.watchCount ?? prev.views),
+            commentCount: Number(prog.commentCount ?? prev.commentCount),
+            description: prog.description || prev.description
+          };
+        });
+      }
+    } catch {}
   };
 
   const openNicopediaModal = async (word: string) => {
@@ -627,8 +896,9 @@ export default function App() {
   };
 
   const switchView = (view: ViewType) => {
+    const activeEl = getActiveMediaEl();
     if (currentView === 'player' && view !== 'player' && currentVideo) {
-      if (videoRef.current && !videoRef.current.paused) {
+      if (activeEl && !activeEl.paused) {
         setFloatingPlayerVisible(true);
       }
     } else if (view === 'player') {
@@ -643,6 +913,7 @@ export default function App() {
 
   const playVideo = (v: Video, modeOverride?: 'freemake' | 'embed' | 'custom', qualityOverride?: string) => {
     videoRetryCountRef.current = 0;
+    loadedStreamKeyRef.current = '';
     const targetMode: 'freemake' | 'embed' | 'custom' = modeOverride || 'freemake';
     if (qualityOverride) {
       setFreemakeQuality(qualityOverride);
@@ -676,16 +947,26 @@ export default function App() {
       hlsRef.current = null;
     }
 
-    // Seed initial danmaku while authentic nvcomment loads
-    const baseDanmaku = getVideoDanmaku(v.id);
-    const initialDanmakuList = v.initialDanmaku && v.initialDanmaku.length > 0 ? v.initialDanmaku : [];
-    const liveComments: NicoComment[] = initialDanmakuList.map((text, idx) => ({
-      id: `live-cmt-${v.id}-${idx}`,
-      text,
-      timeMs: (idx * 2000) % 60000,
-      color: ['#ffffff', '#ffffff', '#ffdd00', '#66ccff', '#ff9999', '#77ff77'][idx % 6]
-    }));
-    setDanmakuPool([...liveComments, ...baseDanmaku]);
+    setLiveComments([]);
+    seenLiveCommentIdsRef.current.clear();
+    liveCommentsCursorRef.current = 0;
+
+    // Seed initial danmaku while authentic nvcomment loads (skip VOD seed for live streams)
+    if (v.isLive) {
+      setDanmakuPool([]);
+      setLiveCommentsLoading(true);
+    } else {
+      setLiveCommentsLoading(false);
+      const baseDanmaku = getVideoDanmaku(v.id);
+      const initialDanmakuList = v.initialDanmaku && v.initialDanmaku.length > 0 ? v.initialDanmaku : [];
+      const seedComments: NicoComment[] = initialDanmakuList.map((text, idx) => ({
+        id: `live-cmt-${v.id}-${idx}`,
+        text,
+        timeMs: (idx * 2000) % 60000,
+        color: ['#ffffff', '#ffffff', '#ffdd00', '#66ccff', '#ff9999', '#77ff77'][idx % 6]
+      }));
+      setDanmakuPool([...seedComments, ...baseDanmaku]);
+    }
 
     // 1. Fetch authentic watch/v3_guest metadata (tags, counts, real owner, description)
     if (/^(sm|so|nm)\d+$/i.test(targetNicoId)) {
@@ -723,7 +1004,7 @@ export default function App() {
               postedAt: c.postedAt,
               score: c.score
             }));
-            setDanmakuPool(data.source === 'nvcomment' ? apiComments : [...apiComments, ...baseDanmaku]);
+            setDanmakuPool(data.source === 'nvcomment' ? apiComments : [...apiComments, ...getVideoDanmaku(v.id)]);
           }
         })
         .catch(() => {});
@@ -762,9 +1043,9 @@ export default function App() {
     switchView('player');
   };
 
-  // Continuous Danmaku comment flow when watching in lightweight HTML5 or embed mode
+  // Continuous Danmaku comment flow when watching VOD in lightweight HTML5 or embed mode
   useEffect(() => {
-    if (currentView !== 'player' || !nicoCommentsOn || danmakuPool.length === 0) return;
+    if (currentView !== 'player' || !nicoCommentsOn || currentVideo?.isLive || danmakuPool.length === 0) return;
 
     let idx = 0;
     // Initial burst of comments so comments flow immediately across the video
@@ -790,7 +1071,10 @@ export default function App() {
 
     const timer = setInterval(() => {
       if (!nicoCommentsOn || danmakuPool.length === 0) return;
-      if (playerMode === 'custom' && videoRef.current && videoRef.current.paused) return;
+      if (playerMode === 'custom') {
+        const el = getActiveMediaEl();
+        if (el && el.paused) return;
+      }
 
       const item = danmakuPool[idx % danmakuPool.length];
       idx++;
@@ -809,14 +1093,106 @@ export default function App() {
     }, 1300);
 
     return () => clearInterval(timer);
-  }, [playerMode, currentView, nicoCommentsOn, danmakuPool, currentVideo?.id]);
+  }, [playerMode, currentView, nicoCommentsOn, danmakuPool, currentVideo?.id, currentVideo?.isLive]);
+
+  // Real-time Niconico Live comment polling & Danmaku spawning
+  useEffect(() => {
+    const liveId = (currentVideo?.nicoId || currentVideo?.id || '').toLowerCase();
+    if (currentView !== 'player' || !currentVideo?.isLive || !/^lv\d+$/.test(liveId)) {
+      return;
+    }
+
+    let cancelled = false;
+    let firstFetch = true;
+
+    const pollComments = async () => {
+      try {
+        const cursor = liveCommentsCursorRef.current;
+        const url = `/api/nico/live/comments/${encodeURIComponent(liveId)}${cursor > 0 ? `?since=${cursor}` : ''}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (cancelled) return;
+
+        if (data.serverTime) {
+          liveCommentsCursorRef.current = Number(data.serverTime);
+        }
+
+        if (data.success && Array.isArray(data.comments)) {
+          const fresh: LiveChatComment[] = [];
+          for (const c of data.comments as LiveChatComment[]) {
+            if (!c?.id || seenLiveCommentIdsRef.current.has(c.id)) continue;
+            seenLiveCommentIdsRef.current.add(c.id);
+            fresh.push(c);
+          }
+
+          if (seenLiveCommentIdsRef.current.size > 1200) {
+            const trimmed = Array.from(seenLiveCommentIdsRef.current).slice(-600);
+            seenLiveCommentIdsRef.current = new Set(trimmed);
+          }
+
+          if (fresh.length > 0) {
+            setLiveComments((prev) => [...prev, ...fresh].slice(-150));
+
+            if (nicoCommentsOnRef.current && !radioModeRef.current) {
+              const danmakuBatch = fresh.filter((c) => !c.isSystem).slice(-6);
+              danmakuBatch.forEach((c, idx) => {
+                window.setTimeout(() => {
+                  if (cancelled || !nicoCommentsOnRef.current || radioModeRef.current) return;
+                  const lane = (idx + Math.floor(Math.random() * 8)) % 8;
+                  const activeItem: ActiveDanmakuItem = {
+                    id: c.id,
+                    text: c.text,
+                    topPercent: 5 + lane * 11,
+                    color: c.color || '#ffffff',
+                    key: `live-danmaku-${c.id}-${Date.now()}-${idx}`
+                  };
+                  setActiveDanmaku((prev) => [...prev, activeItem]);
+                  window.setTimeout(() => {
+                    setActiveDanmaku((prev) => prev.filter((d) => d.key !== activeItem.key));
+                  }, 7800);
+                }, firstFetch ? idx * 320 : idx * 240);
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore transient poll errors and retry on next interval
+      } finally {
+        if (firstFetch && !cancelled) {
+          firstFetch = false;
+          setLiveCommentsLoading(false);
+        }
+      }
+    };
+
+    void pollComments();
+    const timer = window.setInterval(() => {
+      void pollComments();
+    }, 2200);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentView, currentVideo?.id, currentVideo?.isLive]);
+
+  // Auto-scroll live chat panel to latest comment when user is near bottom
+  useEffect(() => {
+    const el = liveChatListRef.current;
+    if (!el || liveComments.length === 0) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 140 || liveComments.length <= 50) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [liveComments]);
 
   useEffect(() => {
-    if (playerMode === 'custom' && currentVideo && videoRef.current) {
-      videoRef.current.play().catch(() => {
-        if (videoRef.current) {
-          videoRef.current.muted = true;
-          videoRef.current.play().catch(() => {});
+    const el = getActiveMediaEl();
+    if (playerMode === 'custom' && currentVideo && el) {
+      el.play().catch(() => {
+        if (!radioMode) {
+          el.muted = true;
+          el.play().catch(() => {});
         }
       });
     }
@@ -889,6 +1265,14 @@ export default function App() {
       }
     }
 
+    // Check if query contains a Niconico Live ID (e.g. lv351891443)
+    const matchLv = q.match(/\blv\d+\b/i);
+    if (matchLv && page === 1) {
+      const lvId = matchLv[0].toLowerCase();
+      await playLiveProgram({ id: lvId, url: `https://live.nicovideo.jp/watch/${lvId}` });
+      return;
+    }
+
     // If user pasted any external video URL (TikTok, X, Vimeo, etc.), open Freemake-style Downloader & inspect
     if (/^https?:\/\//i.test(raw) && page === 1) {
       setDlUrlInput(raw);
@@ -930,14 +1314,15 @@ export default function App() {
   };
 
   const handleTimeUpdate = () => {
-    if (videoRef.current && videoRef.current.duration > 0) {
-      const cur = videoRef.current.currentTime;
-      const dur = videoRef.current.duration;
+    const activeEl = getActiveMediaEl();
+    if (activeEl && activeEl.duration > 0) {
+      const cur = activeEl.currentTime;
+      const dur = activeEl.duration;
       setVideoPlayPercent(Math.min(100, Math.round((cur / dur) * 100)));
     }
 
-    if (!videoRef.current || !nicoCommentsOn) return;
-    const timeMs = videoRef.current.currentTime * 1000;
+    if (!activeEl || !nicoCommentsOn || radioMode) return;
+    const timeMs = activeEl.currentTime * 1000;
 
     danmakuPool.forEach((item) => {
       if (!danmakuTimerRef.current.has(item.id) && Math.abs(item.timeMs - timeMs) < 1600) {
@@ -958,13 +1343,15 @@ export default function App() {
     });
   };
 
-  const toggleSubscriptionState = (channel: { url: string; name: string; avatar?: string }) => {
+  const toggleSubscriptionState = (channel: { url: string; name: string; avatar?: string; userId?: string }) => {
     if (!channel.url && !channel.name) return;
-    const url = channel.url || `https://www.nicovideo.jp/user/${encodeURIComponent(channel.name)}`;
+    const extractedId = channel.userId || (channel.url || '').match(/\/user\/(\d+)/)?.[1] || '';
+    const url = channel.url || (extractedId ? `https://www.nicovideo.jp/user/${extractedId}` : `https://www.nicovideo.jp/user/${encodeURIComponent(channel.name)}`);
     toggleSubscription({
       url,
       name: channel.name,
-      avatar: channel.avatar
+      avatar: channel.avatar,
+      userId: extractedId || undefined
     });
     setSubscriptions(getSubscriptions());
   };
@@ -1045,18 +1432,78 @@ export default function App() {
       clearInterval(dlIntervalRef.current);
       dlIntervalRef.current = null;
     }
+    if (dlAbortRef.current) {
+      dlAbortRef.current.abort();
+      dlAbortRef.current = null;
+    }
 
     setIsDownloadDialogOpen(false);
     setIsDownloadingOverlay(true);
     setDlProgress(3);
     setDlProgressSize('接続中...');
-    setDlStageText('yt-dlp ダウンロードジョブを開始しています...');
+    setDlStageText('ダウンロードを準備しています...');
     setDlSpeedText('');
     setDlEtaText('');
     setDlReadyFileUrl(null);
     setDlReadyFileName('');
     setDlJobError(null);
     setDlActiveJobId(null);
+
+    const nicoMatch = targetUrl.match(/\b((?:sm|so|nm)\d+)\b/i);
+    const nicoId = nicoMatch ? nicoMatch[1].toLowerCase() : null;
+
+    if (nicoId) {
+      const controller = new AbortController();
+      dlAbortRef.current = controller;
+      const localJobId = `nico-${nicoId}-${Date.now()}`;
+      setDlActiveJobId(localJobId);
+
+      try {
+        const audioOnly = format === 'mp3';
+        const res = await downloadNiconicoInBrowser({
+          nicoId,
+          title,
+          quality: quality || '720',
+          audioOnly,
+          signal: controller.signal,
+          onProgress: (p) => {
+            setDlProgress(p.percent);
+            setDlStageText(p.stage);
+            const mb = (p.downloadedBytes / (1024 * 1024)).toFixed(1);
+            setDlProgressSize(p.speedText ? `${mb} MB (${p.speedText})` : `${mb} MB`);
+            setDlSpeedText(p.speedText);
+          }
+        });
+
+        dlAbortRef.current = null;
+        const sizeMb = `${(res.sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+        setDlProgress(100);
+        setDlProgressSize(`完了 (${sizeMb})`);
+        setDlSpeedText('');
+        setDlReadyFileUrl(res.blobUrl);
+        setDlReadyFileName(res.fileName);
+        setDlRecentJobs((prev) => [
+          {
+            jobId: localJobId,
+            title,
+            format: audioOnly ? 'M4A音声' : 'MP4',
+            quality: audioOnly ? '音声' : `${quality}p`,
+            fileUrl: res.blobUrl,
+            fileName: res.fileName,
+            sizeMb
+          },
+          ...prev.filter((j) => j.jobId !== localJobId)
+        ].slice(0, 12));
+
+        triggerFileDownload(res.blobUrl, res.fileName);
+      } catch (err: any) {
+        dlAbortRef.current = null;
+        if (err?.name === 'AbortError' || controller.signal.aborted) return;
+        setDlJobError(err?.message || 'ダウンロードに失敗しました。');
+        setDlStageText('エラーが発生しました');
+      }
+      return;
+    }
 
     try {
       const startRes = await fetch('/api/dl/start', {
@@ -1081,6 +1528,27 @@ export default function App() {
       dlIntervalRef.current = window.setInterval(async () => {
         try {
           const pRes = await fetch(`/api/dl/progress/${jobId}`);
+          if (pRes.status === 404) {
+            if (dlIntervalRef.current) {
+              clearInterval(dlIntervalRef.current);
+              dlIntervalRef.current = null;
+            }
+            const safeTitle = title.replace(/[\\/:*?"<>|\r\n]+/g, '_').slice(0, 80) || 'video';
+            const ext = format === 'mp3' ? 'm4a' : format === 'webm' ? 'webm' : 'mp4';
+            const fileName = format === 'mp3' ? `${safeTitle}.${ext}` : `${safeTitle}_${quality}p.${ext}`;
+            const directUrl = `/api/dl/direct?url=${encodeURIComponent(targetUrl)}&format=${encodeURIComponent(format)}&quality=${encodeURIComponent(quality)}&title=${encodeURIComponent(title)}`;
+            setDlProgress(100);
+            setDlStageText('直接ダウンロードを開始しています...');
+            setDlProgressSize('直接保存');
+            setDlReadyFileUrl(directUrl);
+            setDlReadyFileName(fileName);
+            setDlRecentJobs((prev) => [
+              { jobId, title, format: format.toUpperCase(), quality: format === 'mp3' ? '音声' : `${quality}p`, fileUrl: directUrl, fileName, sizeMb: '' },
+              ...prev.filter((j) => j.jobId !== jobId)
+            ].slice(0, 12));
+            triggerFileDownload(directUrl, fileName);
+            return;
+          }
           const pData = await pRes.json();
           if (!pRes.ok || !pData.ok) return;
 
@@ -1098,7 +1566,7 @@ export default function App() {
               dlIntervalRef.current = null;
             }
             const fileUrl = `/api/dl/file/${jobId}`;
-            const fileName = pData.fileName || `video.${format === 'mp3' ? 'mp3' : format}`;
+            const fileName = pData.fileName || `video.${format === 'mp3' ? 'm4a' : format}`;
             const sizeMb = pData.fileSize ? `${(pData.fileSize / (1024 * 1024)).toFixed(1)} MB` : pData.totalSize || '';
 
             setDlProgress(100);
@@ -1106,7 +1574,7 @@ export default function App() {
             setDlReadyFileUrl(fileUrl);
             setDlReadyFileName(fileName);
             setDlRecentJobs((prev) => [
-              { jobId, title, format: format.toUpperCase(), quality: format === 'mp3' ? '320kbps' : `${quality}p`, fileUrl, fileName, sizeMb },
+              { jobId, title, format: format.toUpperCase(), quality: format === 'mp3' ? '音声' : `${quality}p`, fileUrl, fileName, sizeMb },
               ...prev.filter((j) => j.jobId !== jobId)
             ].slice(0, 12));
 
@@ -1141,7 +1609,11 @@ export default function App() {
       clearInterval(dlIntervalRef.current);
       dlIntervalRef.current = null;
     }
-    if (dlActiveJobId && !dlReadyFileUrl) {
+    if (dlAbortRef.current) {
+      dlAbortRef.current.abort();
+      dlAbortRef.current = null;
+    }
+    if (dlActiveJobId && !dlActiveJobId.startsWith('nico-') && !dlReadyFileUrl) {
       fetch(`/api/dl/cancel/${dlActiveJobId}`, { method: 'POST' }).catch(() => {});
     }
     setIsDownloadingOverlay(false);
@@ -1152,14 +1624,25 @@ export default function App() {
   };
 
   const handleDeleteRecentJob = async (jobId: string) => {
+    const target = dlRecentJobs.find((item) => item.jobId === jobId);
+    if (target?.fileUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(target.fileUrl);
+    }
     setDlRecentJobs((prev) => prev.filter((item) => item.jobId !== jobId));
-    try {
-      await fetch(`/api/dl/job/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
-    } catch {}
+    if (!jobId.startsWith('nico-')) {
+      try {
+        await fetch(`/api/dl/job/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+      } catch {}
+    }
   };
 
   const handleClearAllRecentJobs = async () => {
-    const targets = dlRecentJobs.map((j) => j.jobId);
+    for (const j of dlRecentJobs) {
+      if (j.fileUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(j.fileUrl);
+      }
+    }
+    const targets = dlRecentJobs.map((j) => j.jobId).filter((id) => !id.startsWith('nico-'));
     setDlRecentJobs([]);
     await Promise.all(
       targets.map((jobId) =>
@@ -1247,7 +1730,7 @@ export default function App() {
             ? dlJobError
             : dlReadyFileUrl
               ? '自動で保存が始まらない場合は下の「ファイルを保存」ボタンを押してください。'
-              : 'yt-dlp ＋ ffmpeg で実ファイルを生成しています。このままお待ちください。'}
+              : '動画・音声データを直接取得してファイルを構築しています。このままお待ちください。'}
         </p>
         <div className="progress-bar-container">
           <div id="dl-progress-bar" style={{ width: `${dlProgress}%`, background: dlJobError ? '#ff5555' : dlReadyFileUrl ? '#22cc88' : undefined }}></div>
@@ -1454,33 +1937,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* 4. Announcements Dialog */}
-      <div
-        id="announcements-dialog"
-        className={`modal-backdrop ${isAnnouncementsOpen ? 'show' : ''}`}
-        role="dialog"
-      >
-        <div className="modal-card">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '16px' }}>
-            <h2 id="announcements-title" style={{ margin: 0, fontSize: '20px' }}>お知らせ</h2>
-            <button className="terms-button secondary" type="button" onClick={() => setIsAnnouncementsOpen(false)}>
-              閉じる
-            </button>
-          </div>
-          <div id="announcements-list" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            {ANNOUNCEMENTS.map((a) => (
-              <article key={a.id} style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '12px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                  <span style={{ color: 'var(--accent-strong)', fontSize: '12px', fontWeight: 'bold' }}>{a.date}</span>
-                  <h4 style={{ margin: 0, fontSize: '15px' }}>{a.title}</h4>
-                </div>
-                <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-muted)', lineHeight: '1.5' }}>{a.body}</p>
-              </article>
-            ))}
-          </div>
-        </div>
-      </div>
-
       {/* 5. Login / Account Modal */}
       <div
         id="login-dialog"
@@ -1546,16 +2002,6 @@ export default function App() {
           </form>
 
           <div style={{ borderTop: '1px solid var(--border-color)', marginTop: '16px', paddingTop: '14px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-            <button
-              type="button"
-              className="zero-secondary-btn"
-              onClick={() => {
-                setIsLoginModalOpen(false);
-                setIsAnnouncementsOpen(true);
-              }}
-            >
-              お知らせ ({ANNOUNCEMENTS.length})
-            </button>
             <button
               type="button"
               className="zero-secondary-btn"
@@ -1771,6 +2217,11 @@ export default function App() {
           >
             <span className="material-icons">subscriptions</span>
             <span>登録チャンネル</span>
+            {favoriteLiveAlerts.length > 0 && (
+              <span className="sidebar-live-badge" title="登録チャンネルが生放送中">
+                LIVE {favoriteLiveAlerts.length}
+              </span>
+            )}
           </div>
           <div
             className={`sidebar-item ${currentView === 'playlists' ? 'active' : ''}`}
@@ -1795,6 +2246,11 @@ export default function App() {
           >
             <span className="material-icons">sensors</span>
             <span>生放送・静画・大百科</span>
+            {favoriteLiveAlerts.length > 0 && (
+              <span className="sidebar-live-badge">
+                配信中
+              </span>
+            )}
           </div>
           <div
             className={`sidebar-item ${currentView === 'settings' ? 'active' : ''}`}
@@ -1834,27 +2290,92 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-                {homeGenre !== 'classics' && (
-                  <div className="zero-tabs-strip">
-                    {[
-                      { id: 'hour', label: '毎時' },
-                      { id: '24h', label: '24時間' },
-                      { id: 'week', label: '週間' },
-                      { id: 'month', label: '月間' },
-                      { id: 'total', label: '合計' }
-                    ].map((t) => (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  {homeGenre !== 'classics' && (
+                    <div className="zero-tabs-strip">
+                      {[
+                        { id: 'hour', label: '毎時' },
+                        { id: '24h', label: '24時間' },
+                        { id: 'week', label: '週間' },
+                        { id: 'month', label: '月間' },
+                        { id: 'total', label: '合計' }
+                      ].map((t) => (
+                        <button
+                          key={t.id}
+                          type="button"
+                          className={`zero-tab-btn ${homeTerm === t.id ? 'active' : ''}`}
+                          onClick={() => fetchRanking(homeGenre, t.id)}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="zero-secondary-btn"
+                    onClick={() => {
+                      setNicoHubTab('live');
+                      switchView('nico-hub');
+                      if (livePrograms.length === 0) void loadNicoLivePrograms();
+                    }}
+                    style={{ padding: '6px 12px', fontSize: '12.5px', gap: '5px' }}
+                  >
+                    <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+                    <span>生放送 (LIVE)</span>
+                  </button>
+                </div>
+              </div>
+
+              {favoriteLiveAlerts.length > 0 && !liveAlertsDismissed && (
+                <section className="live-alert-banner" aria-label="お気に入り生放送通知">
+                  <div className="live-alert-header">
+                    <div className="live-alert-title">
+                      <span className="live-stream-dot" aria-hidden="true" />
+                      <span>登録チャンネルが生放送中！（{favoriteLiveAlerts.length}件）</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <button
-                        key={t.id}
                         type="button"
-                        className={`zero-tab-btn ${homeTerm === t.id ? 'active' : ''}`}
-                        onClick={() => fetchRanking(homeGenre, t.id)}
+                        className="zero-secondary-btn"
+                        style={{ padding: '4px 10px', fontSize: '11.5px' }}
+                        onClick={() => switchView('subscriptions')}
                       >
-                        {t.label}
+                        登録一覧を見る
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setLiveAlertsDismissed(true)}
+                        aria-label="通知を閉じる"
+                        style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px' }}
+                      >
+                        <span className="material-icons" style={{ fontSize: '18px' }}>close</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="live-alert-chips">
+                    {favoriteLiveAlerts.map((alert) => (
+                      <button
+                        key={alert.id}
+                        type="button"
+                        className="live-alert-chip"
+                        onClick={() => void playLiveProgram(alert)}
+                      >
+                        <img
+                          src={alert.providerAvatar || alert.thumbnail}
+                          alt={alert.providerName}
+                          className="live-alert-chip-avatar"
+                          referrerPolicy="no-referrer"
+                        />
+                        <div className="live-alert-chip-meta">
+                          <span className="live-alert-chip-name">配信中 · {alert.providerName}</span>
+                          <span className="live-alert-chip-title">{alert.title}</span>
+                        </div>
                       </button>
                     ))}
                   </div>
-                )}
-              </div>
+                </section>
+              )}
 
               {isLoadingRanking ? (
                 <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-muted)' }}>
@@ -2099,46 +2620,90 @@ export default function App() {
             {/* 4. Subscriptions View */}
             <div id="subscriptions-view" className={`view ${currentView === 'subscriptions' || currentView === 'library' ? 'active' : ''}`}>
               <div className="library-section">
-                <h2 style={{ marginTop: 0 }}>登録チャンネル</h2>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', marginBottom: '12px' }}>
+                  <h2 style={{ margin: 0 }}>登録チャンネル</h2>
+                  {subscriptions.length > 0 && (
+                    <button
+                      type="button"
+                      className="zero-secondary-btn"
+                      onClick={() => void checkFavoriteLiveAlerts(subscriptions)}
+                    >
+                      <span className="material-icons" style={{ fontSize: '17px' }}>sensors</span>
+                      生放送状況を再確認
+                    </button>
+                  )}
+                </div>
                 <div id="subscriptions-list" className="library-list subscription-list">
                   {subscriptions.length === 0 ? (
                     <div style={{ gridColumn: '1 / -1', padding: '24px 0', color: '#888' }}>
                       登録チャンネルはありません。動画再生画面の「登録」ボタンからお気に入りのチャンネルを登録できます。
                     </div>
                   ) : (
-                    subscriptions.map((sub) => (
-                      <article key={sub.url} className="library-card">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
-                          <div
-                            className="channel-avatar"
-                            style={{ backgroundImage: sub.avatar ? `url('${sub.avatar}')` : 'none', width: '42px', height: '42px' }}
-                          >
-                            {!sub.avatar && (sub.name[0] || 'チ')}
+                    subscriptions.map((sub) => {
+                      const subUid = sub.userId || sub.url.match(/\/user\/(\d+)/)?.[1] || '';
+                      const liveMatch = favoriteLiveAlerts.find(
+                        (a) =>
+                          a.matchedSubUrl === sub.url ||
+                          (subUid && a.providerId === subUid) ||
+                          (sub.name && a.providerName.trim().toLowerCase() === sub.name.trim().toLowerCase())
+                      );
+                      return (
+                        <article
+                          key={sub.url}
+                          className="library-card"
+                          style={liveMatch ? { borderColor: '#dc2626', boxShadow: '0 0 0 1px rgba(220, 38, 38, 0.2)' } : undefined}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
+                            <div
+                              className="channel-avatar"
+                              style={{ backgroundImage: sub.avatar ? `url('${sub.avatar}')` : 'none', width: '42px', height: '42px' }}
+                            >
+                              {!sub.avatar && (sub.name[0] || 'チ')}
+                            </div>
+                            <div style={{ minWidth: 0, flex: 1 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                <h3 style={{ margin: 0, fontSize: '15px' }}>{sub.name}</h3>
+                                {liveMatch && (
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '11px', fontWeight: 800, color: '#dc2626' }}>
+                                    <span className="live-stream-dot" aria-hidden="true" />
+                                    配信中！
+                                  </span>
+                                )}
+                              </div>
+                              <p style={{ margin: '2px 0 0', color: 'var(--text-muted)', fontSize: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {liveMatch ? liveMatch.title : 'このサイト内で登録済み'}
+                              </p>
+                            </div>
                           </div>
-                          <div>
-                            <h3 style={{ margin: 0, fontSize: '15px' }}>{sub.name}</h3>
-                            <p style={{ margin: '2px 0 0', color: '#888', fontSize: '12px' }}>このサイト内で登録済み</p>
+                          <div className="library-card-actions">
+                            {liveMatch && (
+                              <button
+                                type="button"
+                                style={{ background: '#dc2626', color: '#ffffff', borderColor: '#dc2626' }}
+                                onClick={() => void playLiveProgram(liveMatch)}
+                              >
+                                今すぐ視聴
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void openChannelProfile({ url: sub.url, name: sub.name, avatar: sub.avatar, userId: subUid || undefined });
+                              }}
+                            >
+                              チャンネルを開く
+                            </button>
+                            <button
+                              className="library-remove"
+                              type="button"
+                              onClick={() => toggleSubscriptionState(sub)}
+                            >
+                              登録解除
+                            </button>
                           </div>
-                        </div>
-                        <div className="library-card-actions">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void openChannelProfile({ url: sub.url, name: sub.name, avatar: sub.avatar });
-                            }}
-                          >
-                            チャンネルを開く
-                          </button>
-                          <button
-                            className="library-remove"
-                            type="button"
-                            onClick={() => toggleSubscriptionState(sub)}
-                          >
-                            登録解除
-                          </button>
-                        </div>
-                      </article>
-                    ))
+                        </article>
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -2415,15 +2980,40 @@ export default function App() {
 
                 {nicoHubTab === 'live' && (
                   <div>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                      <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>現在放送中のニコニコ生放送（視聴者数順）</span>
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const m = liveIdInput.trim().match(/\b(lv\d+)\b/i);
+                        if (!m) {
+                          showPlayerNotification('lvから始まる生放送IDまたはURLを入力してください');
+                          return;
+                        }
+                        const lvId = m[1].toLowerCase();
+                        void playLiveProgram({ id: lvId, url: `https://live.nicovideo.jp/watch/${lvId}` });
+                      }}
+                      style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '12px' }}
+                    >
+                      <input
+                        type="text"
+                        className="zero-input"
+                        value={liveIdInput}
+                        onChange={(e) => setLiveIdInput(e.target.value)}
+                        placeholder="生放送ID・URLを直接再生（例: lv351891443）"
+                        style={{ flex: '1 1 220px' }}
+                      />
+                      <button type="submit" className="zero-primary-btn">
+                        生放送を視聴
+                      </button>
                       <button
                         type="button"
                         className="zero-secondary-btn"
                         onClick={() => void loadNicoLivePrograms()}
                       >
-                        更新
+                        一覧を更新
                       </button>
+                    </form>
+                    <div style={{ marginBottom: '12px' }}>
+                      <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>現在放送中のニコニコ生放送（タップでアプリ内再生）</span>
                     </div>
                     {isLoadingLive ? (
                       <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>
@@ -2433,13 +3023,10 @@ export default function App() {
                     ) : (
                       <div className="video-grid">
                         {livePrograms.map((p) => (
-                          <a
+                          <div
                             key={p.id}
-                            href={p.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
                             className="video-card-grid"
-                            style={{ textDecoration: 'none' }}
+                            onClick={() => void playLiveProgram(p)}
                           >
                             <div className="video-card-thumb-wrap">
                               <img src={p.thumbnail} alt={p.title} loading="lazy" referrerPolicy="no-referrer" />
@@ -2451,7 +3038,7 @@ export default function App() {
                               <h3>{p.title}</h3>
                               <p>{p.providerName} · 来場 {p.watchCount.toLocaleString()} · コメ {p.commentCount.toLocaleString()}</p>
                             </div>
-                          </a>
+                          </div>
                         ))}
                       </div>
                     )}
@@ -3102,7 +3689,7 @@ export default function App() {
                           className="action-btn"
                           onClick={() => switchPlayerMode('freemake')}
                           style={{
-                            padding: '6px 14px',
+                            padding: '6px 12px',
                             borderRadius: '8px',
                             border: '1px solid ' + (playerMode === 'freemake' ? 'var(--accent-strong)' : 'var(--border-color)'),
                             background: playerMode === 'freemake' ? 'var(--accent)' : 'var(--bg-surface-alt)',
@@ -3116,7 +3703,7 @@ export default function App() {
                           }}
                         >
                           <span className="material-icons" style={{ fontSize: '15px' }}>stream</span>
-                          <span>Freemake ストリーム再生</span>
+                          <span>{currentVideo.isLive ? 'ライブHLS再生' : 'Freemake ストリーム再生'}</span>
                           {freemakeStreamType && playerMode === 'freemake' && (
                             <span style={{ fontSize: '10px', background: 'rgba(0,0,0,0.28)', padding: '1px 5px', borderRadius: '4px', color: '#ffffff' }}>
                               {freemakeStreamType.toUpperCase()}
@@ -3128,7 +3715,7 @@ export default function App() {
                           className="action-btn"
                           onClick={() => switchPlayerMode('embed')}
                           style={{
-                            padding: '6px 14px',
+                            padding: '6px 12px',
                             borderRadius: '8px',
                             border: '1px solid ' + (playerMode === 'embed' ? 'var(--accent-strong)' : 'var(--border-color)'),
                             background: playerMode === 'embed' ? 'var(--accent)' : 'var(--bg-surface-alt)',
@@ -3141,27 +3728,29 @@ export default function App() {
                             gap: '4px'
                           }}
                         >
-                          <span>公式ニコニコプレイヤー</span>
+                          <span>{currentVideo.isLive ? '公式生放送プレイヤー' : '公式ニコニコプレイヤー'}</span>
                           <span style={{ fontSize: '10px', background: playerMode === 'embed' ? 'rgba(0,0,0,0.25)' : 'var(--accent-soft)', padding: '1px 5px', borderRadius: '4px', color: playerMode === 'embed' ? '#fde047' : 'var(--accent-strong)' }}>★即時</span>
                         </button>
-                        <button
-                          type="button"
-                          className="action-btn"
-                          onClick={() => switchPlayerMode('custom')}
-                          style={{
-                            padding: '6px 14px',
-                            borderRadius: '8px',
-                            border: '1px solid ' + (playerMode === 'custom' ? 'var(--accent-strong)' : 'var(--border-color)'),
-                            background: playerMode === 'custom' ? 'var(--accent)' : 'var(--bg-surface-alt)',
-                            color: playerMode === 'custom' ? '#ffffff' : 'var(--text-main)',
-                            fontSize: '12px',
-                            fontWeight: 'bold',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          HTML5キャッシュ再生
-                        </button>
-                        {playerMode === 'freemake' && (
+                        {!currentVideo.isLive && (
+                          <button
+                            type="button"
+                            className="action-btn"
+                            onClick={() => switchPlayerMode('custom')}
+                            style={{
+                              padding: '6px 12px',
+                              borderRadius: '8px',
+                              border: '1px solid ' + (playerMode === 'custom' ? 'var(--accent-strong)' : 'var(--border-color)'),
+                              background: playerMode === 'custom' ? 'var(--accent)' : 'var(--bg-surface-alt)',
+                              color: playerMode === 'custom' ? '#ffffff' : 'var(--text-main)',
+                              fontSize: '12px',
+                              fontWeight: 'bold',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            HTML5キャッシュ再生
+                          </button>
+                        )}
+                        {playerMode === 'freemake' && !currentVideo.isLive && !radioMode && (
                           <select
                             aria-label="ストリーム画質"
                             value={freemakeQuality}
@@ -3182,10 +3771,37 @@ export default function App() {
                             <option value="360">360p (軽量)</option>
                           </select>
                         )}
+                        <button
+                          type="button"
+                          id="radio-mode-toggle-btn"
+                          className="action-btn"
+                          onClick={toggleRadioMode}
+                          style={{
+                            padding: '6px 12px',
+                            borderRadius: '8px',
+                            border: '1px solid ' + (radioMode ? '#0284c7' : 'var(--border-color)'),
+                            background: radioMode ? '#0369a1' : 'var(--bg-surface-alt)',
+                            color: radioMode ? '#ffffff' : 'var(--text-main)',
+                            fontSize: '12px',
+                            fontWeight: 'bold',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '5px'
+                          }}
+                          title="音声のみを受信して通信量を節約し、バックグラウンド再生に対応します"
+                        >
+                          <span className="material-icons" style={{ fontSize: '15px' }}>headphones</span>
+                          <span>{radioMode ? 'ラジオモード ON (省データ)' : 'ラジオモード (音声のみ)'}</span>
+                        </button>
                       </div>
 
                       <a
-                        href={`https://www.nicovideo.jp/watch/${currentVideo.nicoId || currentVideo.id}`}
+                        href={
+                          currentVideo.isLive
+                            ? `https://live.nicovideo.jp/watch/${currentVideo.nicoId || currentVideo.id}`
+                            : `https://www.nicovideo.jp/watch/${currentVideo.nicoId || currentVideo.id}`
+                        }
                         target="_blank"
                         rel="noopener noreferrer"
                         style={{
@@ -3251,7 +3867,7 @@ export default function App() {
                         />
 
                         {/* Danmaku layer overlaid directly on top of authentic Nico video */}
-                        {nicoCommentsOn && (
+                        {nicoCommentsOn && !radioMode && (
                           <div id="nico-comment-layer" className="nico-comment-layer" style={{ pointerEvents: 'none' }}>
                             {activeDanmaku.map((d) => (
                               <div
@@ -3267,75 +3883,157 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="video-container" id="video-container-inner" ref={videoContainerRef}>
-                        <video
-                          id="video-player"
-                          ref={videoRef}
-                          src={playerMode === 'custom' && currentVideo ? getStreamUrl(currentVideo) : undefined}
-                          controls
-                          autoPlay
-                          playsInline
-                          preload="auto"
-                          loop={playerLoop}
-                          onPlay={() => {
-                            setIsVideoPlaying(true);
-                            setIsVideoLoading(false);
-                          }}
-                          onPause={() => setIsVideoPlaying(false)}
-                          onLoadedMetadata={() => {
-                            setIsVideoLoading(false);
-                            setVideoLoadingPercent(100);
-                          }}
-                          onCanPlay={() => {
-                            setVideoLoadingPercent(100);
-                            setVideoLoadingStage('動画準備完了！');
-                            setIsVideoLoading(false);
-                          }}
-                          onPlaying={() => {
-                            setVideoLoadingPercent(100);
-                            setIsVideoLoading(false);
-                            setIsVideoPlaying(true);
-                            setVideoError(null);
-                          }}
-                          onError={(e) => {
-                            console.warn('HTML5 Video player error:', e);
-                            setIsVideoLoading(false);
-                          }}
-                          onTimeUpdate={handleTimeUpdate}
-                          onSeeked={() => danmakuTimerRef.current.clear()}
-                          onEnded={() => {
-                            danmakuTimerRef.current.clear();
-                            setIsVideoPlaying(false);
-                          }}
-                          style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
-                        />
+                        {radioMode ? (
+                          <div className="radio-mode-stage">
+                            <div className="radio-mode-card-row">
+                              <div className="radio-mode-art-wrap">
+                                {currentVideo.thumbnail ? (
+                                  <img
+                                    src={currentVideo.thumbnail}
+                                    alt={currentVideo.title}
+                                    className="radio-mode-art"
+                                    referrerPolicy="no-referrer"
+                                  />
+                                ) : (
+                                  <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                    <span className="material-icons" style={{ fontSize: '40px', color: '#7dd3fc' }}>headphones</span>
+                                  </div>
+                                )}
+                              </div>
+                              <div className="radio-mode-meta">
+                                <div className="radio-mode-kicker">
+                                  <span className="material-icons" style={{ fontSize: '15px' }}>headphones</span>
+                                  <span>ラジオモード · 音声のみ（省データ）</span>
+                                </div>
+                                <h3 className="radio-mode-title">{currentVideo.title}</h3>
+                                <div className="radio-mode-channel">{currentVideo.channel}</div>
+                              </div>
+                            </div>
 
-                        {/* Big Centered Play Button when video is paused & ready */}
-                        {!isVideoPlaying && !isVideoLoading && !videoError && (
+                            <audio
+                              id="audio-player"
+                              ref={audioRef}
+                              className="radio-mode-audio"
+                              src={playerMode === 'custom' && currentVideo ? getStreamUrl(currentVideo) : undefined}
+                              controls
+                              autoPlay
+                              playsInline
+                              preload="auto"
+                              loop={playerLoop}
+                              onPlay={() => {
+                                setIsVideoPlaying(true);
+                                setIsVideoLoading(false);
+                              }}
+                              onPause={() => setIsVideoPlaying(false)}
+                              onLoadedMetadata={() => {
+                                setIsVideoLoading(false);
+                                setVideoLoadingPercent(100);
+                              }}
+                              onCanPlay={() => {
+                                setVideoLoadingPercent(100);
+                                setVideoLoadingStage('音声再生準備完了！');
+                                setIsVideoLoading(false);
+                              }}
+                              onPlaying={() => {
+                                setVideoLoadingPercent(100);
+                                setIsVideoLoading(false);
+                                setIsVideoPlaying(true);
+                                setVideoError(null);
+                              }}
+                              onError={() => {
+                                setIsVideoLoading(false);
+                              }}
+                              onTimeUpdate={handleTimeUpdate}
+                              onEnded={() => setIsVideoPlaying(false)}
+                            />
+
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', width: 'min(560px, 100%)' }}>
+                              <p className="radio-mode-hint">
+                                映像データを読み込まず音声のみ再生します。アプリ切替や画面ロック中も継続再生できます。
+                              </p>
+                              <button
+                                type="button"
+                                className="zero-secondary-btn"
+                                onClick={toggleRadioMode}
+                                style={{ padding: '5px 12px', fontSize: '12px', background: 'rgba(255,255,255,0.12)', color: '#ffffff', borderColor: 'rgba(255,255,255,0.28)' }}
+                              >
+                                映像も表示する
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <video
+                            id="video-player"
+                            ref={videoRef}
+                            src={playerMode === 'custom' && currentVideo ? getStreamUrl(currentVideo) : undefined}
+                            controls
+                            autoPlay
+                            playsInline
+                            preload="auto"
+                            loop={playerLoop}
+                            onPlay={() => {
+                              setIsVideoPlaying(true);
+                              setIsVideoLoading(false);
+                            }}
+                            onPause={() => setIsVideoPlaying(false)}
+                            onLoadedMetadata={() => {
+                              setIsVideoLoading(false);
+                              setVideoLoadingPercent(100);
+                            }}
+                            onCanPlay={() => {
+                              setVideoLoadingPercent(100);
+                              setVideoLoadingStage('動画準備完了！');
+                              setIsVideoLoading(false);
+                            }}
+                            onPlaying={() => {
+                              setVideoLoadingPercent(100);
+                              setIsVideoLoading(false);
+                              setIsVideoPlaying(true);
+                              setVideoError(null);
+                            }}
+                            onError={(e) => {
+                              console.warn('HTML5 Video player error:', e);
+                              setIsVideoLoading(false);
+                            }}
+                            onTimeUpdate={handleTimeUpdate}
+                            onSeeked={() => danmakuTimerRef.current.clear()}
+                            onEnded={() => {
+                              danmakuTimerRef.current.clear();
+                              setIsVideoPlaying(false);
+                            }}
+                            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
+                          />
+                        )}
+
+                        {/* Big Centered Play Button when media is paused & ready */}
+                        {!isVideoPlaying && !isVideoLoading && !videoError && !radioMode && (
                           <div
                             onClick={(e) => {
                               e.stopPropagation();
-                              if (videoRef.current) {
-                                videoRef.current.muted = false;
-                                videoRef.current.play().then(() => {
+                              const el = getActiveMediaEl();
+                              if (el) {
+                                el.muted = false;
+                                el.play().then(() => {
                                   setIsVideoPlaying(true);
                                 }).catch(() => {
-                                  if (videoRef.current) {
-                                    videoRef.current.muted = true;
-                                    videoRef.current.play().then(() => setIsVideoPlaying(true)).catch(() => {});
+                                  if (el && !radioMode) {
+                                    el.muted = true;
+                                    el.play().then(() => setIsVideoPlaying(true)).catch(() => {});
                                   }
                                 });
                               }
                             }}
                             onTouchEnd={(e) => {
                               e.stopPropagation();
-                              if (videoRef.current) {
-                                videoRef.current.muted = false;
-                                videoRef.current.play().then(() => {
+                              const el = getActiveMediaEl();
+                              if (el) {
+                                el.muted = false;
+                                el.play().then(() => {
                                   setIsVideoPlaying(true);
                                 }).catch(() => {
-                                  if (videoRef.current) {
-                                    videoRef.current.muted = true;
-                                    videoRef.current.play().then(() => setIsVideoPlaying(true)).catch(() => {});
+                                  if (el && !radioMode) {
+                                    el.muted = true;
+                                    el.play().then(() => setIsVideoPlaying(true)).catch(() => {});
                                   }
                                 });
                               }
@@ -3513,13 +4211,15 @@ export default function App() {
                                 type="button"
                                 onClick={() => {
                                   setVideoError(null);
+                                  loadedStreamKeyRef.current = '';
                                   setIsVideoLoading(true);
                                   setVideoLoadingPercent(10);
                                   setVideoLoadingStage('再読み込みを開始...');
                                   videoRetryCountRef.current = 0;
-                                  if (videoRef.current) {
-                                    videoRef.current.load();
-                                    videoRef.current.play().catch(() => {});
+                                  const el = getActiveMediaEl();
+                                  if (el) {
+                                    el.load();
+                                    el.play().catch(() => {});
                                   }
                                 }}
                                 style={{
@@ -3539,7 +4239,7 @@ export default function App() {
                         )}
 
                         {/* Danmaku layer */}
-                        {nicoCommentsOn && (
+                        {nicoCommentsOn && !radioMode && (
                           <div id="nico-comment-layer" className="nico-comment-layer">
                             {activeDanmaku.map((d) => (
                               <div
@@ -3662,7 +4362,14 @@ export default function App() {
                     )}
 
 
-                    <h2 id="video-title" className="video-title">{currentVideo.title}</h2>
+                    <h2 id="video-title" className="video-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      {currentVideo.isLive && (
+                        <span style={{ background: '#dc2626', color: '#ffffff', fontSize: '11px', fontWeight: 800, padding: '2px 8px', borderRadius: '6px', letterSpacing: '0.04em' }}>
+                          LIVE
+                        </span>
+                      )}
+                      <span>{currentVideo.title}</span>
+                    </h2>
 
                     <div className="channel-action-row">
                       <div
@@ -3695,7 +4402,7 @@ export default function App() {
                           className="subscribe-button"
                           id="subscribe-action-btn"
                           type="button"
-                          onClick={() => toggleSubscriptionState({ url: currentVideo.channel_url || '', name: currentVideo.channel, avatar: currentVideo.channelAvatar })}
+                          onClick={() => toggleSubscriptionState({ url: currentVideo.channel_url || '', name: currentVideo.channel, avatar: currentVideo.channelAvatar, userId: currentVideo.userId })}
                         >
                           <span>{isSubscribed(currentVideo.channel_url, currentVideo.channel) ? '登録済み' : '登録'}</span>
                         </button>
@@ -3749,27 +4456,29 @@ export default function App() {
                           {playerLoop ? 'ループ中' : 'ループ'}
                         </button>
 
-                        <button
-                          className="action-btn"
-                          id="pip-action-btn"
-                          type="button"
-                          onClick={async () => {
-                            if (videoRef.current) {
-                              try {
-                                if (document.pictureInPictureElement) {
-                                  await document.exitPictureInPicture();
-                                } else if (videoRef.current.requestPictureInPicture) {
-                                  await videoRef.current.requestPictureInPicture();
+                        {!radioMode && (
+                          <button
+                            className="action-btn"
+                            id="pip-action-btn"
+                            type="button"
+                            onClick={async () => {
+                              if (videoRef.current) {
+                                try {
+                                  if (document.pictureInPictureElement) {
+                                    await document.exitPictureInPicture();
+                                  } else if (videoRef.current.requestPictureInPicture) {
+                                    await videoRef.current.requestPictureInPicture();
+                                  }
+                                } catch (err) {
+                                  console.warn('PiP failed', err);
                                 }
-                              } catch (err) {
-                                console.warn('PiP failed', err);
                               }
-                            }
-                          }}
-                          title="ピクチャーインピクチャー (小窓で再生)"
-                        >
-                          <span className="material-icons" style={{ fontSize: '18px' }}>picture_in_picture_alt</span> PiP
-                        </button>
+                            }}
+                            title="ピクチャーインピクチャー (小窓で再生)"
+                          >
+                            <span className="material-icons" style={{ fontSize: '18px' }}>picture_in_picture_alt</span> PiP
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -3920,99 +4629,176 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Related Videos Column */}
+                  {/* Related Videos / Live Comment Feed Column */}
                   <div className="related-videos">
-                    <h3 style={{ marginTop: 0 }}>関連動画</h3>
-                    <div id="related-results" className="related-list">
-                      {relatedVideos.map((r) => (
-                        <div key={r.id} className="related-card" onClick={() => playVideo(r)}>
-                          <img src={r.thumbnail} alt={r.title} loading="lazy" />
-                          <div className="related-info">
-                            <h4>{r.title}</h4>
-                            <p>{r.channel}<br />{r.views.toLocaleString()}回視聴</p>
-                          </div>
+                    {currentVideo.isLive ? (
+                      <section className="live-chat-panel" aria-label="ライブコメント">
+                        <div className="live-chat-header">
+                          <h3>
+                            <span className="material-icons" style={{ fontSize: '18px', color: 'var(--accent-strong)' }}>forum</span>
+                            ライブコメント（リアルタイム）
+                          </h3>
+                          <span className="live-chat-count">{liveComments.length}件</span>
                         </div>
-                      ))}
-                    </div>
+                        <div className="live-chat-list" ref={liveChatListRef}>
+                          {liveCommentsLoading && liveComments.length === 0 ? (
+                            <div className="live-chat-empty">ライブコメントに接続しています...</div>
+                          ) : liveComments.length === 0 ? (
+                            <div className="live-chat-empty">新しいコメントを待機中...</div>
+                          ) : (
+                            liveComments.map((c) => {
+                              const timeLabel = new Date(c.atMs).toLocaleTimeString('ja-JP', {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit',
+                                hour12: false
+                              });
+                              return (
+                                <div key={c.id} className={`live-chat-row${c.isSystem ? ' system' : ''}`}>
+                                  <div className="live-chat-meta">
+                                    <span className="live-chat-no">
+                                      {c.isSystem ? '案内' : typeof c.no === 'number' ? `#${c.no}` : 'コメ'}
+                                    </span>
+                                    {c.name && <span className="live-chat-name">{c.name}</span>}
+                                    <span className="live-chat-time">{timeLabel}</span>
+                                  </div>
+                                  <div className="live-chat-text">{c.text}</div>
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      </section>
+                    ) : (
+                      <>
+                        <h3 style={{ marginTop: 0 }}>関連動画</h3>
+                        <div id="related-results" className="related-list">
+                          {relatedVideos.map((r) => (
+                            <div key={r.id} className="related-card" onClick={() => playVideo(r)}>
+                              <img src={r.thumbnail} alt={r.title} loading="lazy" />
+                              <div className="related-info">
+                                <h4>{r.title}</h4>
+                                <p>{r.channel}<br />{r.views.toLocaleString()}回視聴</p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               )}
             </div>
           </div>
-
-          {/* App Footer */}
-          <footer className="app-footer">
-            <div className="footer-summary">
-              <div className="footer-visits" title="総アクセス数">
-                <small>閲覧数</small>
-                <strong id="visit-count-val">{visitCount.toLocaleString()}</strong>
-              </div>
-            </div>
-            &copy; 2026 mura<br />
-            <a
-              href="https://script.google.com/macros/s/AKfycbwOzNapEk-Vyh4lciFXyN-29481VuJNy1q3B71lwySZ69Cievt_vd1joijJJpf-d5NR/exec"
-              target="_blank"
-              rel="noreferrer"
-            >
-              ソースコード
-            </a>
-            <span style={{ margin: '0 8px', color: '#bbb' }}>|</span>
-            <button
-              id="footer-rating-button"
-              className="footer-rating-button"
-              type="button"
-              onClick={() => switchView('reviews')}
-            >
-              ★ <span id="footer-rating-average">{avgReview}</span>（評価）
-            </button>
-          </footer>
         </main>
       </div>
 
-      {/* Floating Mini Player (when browsing other pages while video is active) */}
+      {/* Floating Mini Player (when browsing other pages while video/radio is active) */}
       {floatingPlayerVisible && currentVideo && currentView !== 'player' && (
         <aside id="floating-player" aria-label="ミニプレイヤー">
-          <div id="floating-player-media">
-            {playerMode === 'embed' ? (
-              <iframe
-                src={getEmbedUrl(currentVideo)}
-                style={{ width: '100%', height: '100%', border: 0 }}
-                allow="autoplay; fullscreen"
-                title={currentVideo.title}
-              />
-            ) : (
-              <video
-                ref={floatingVideoRef}
-                src={playerMode === 'freemake' && freemakeResolvedUrl ? freemakeResolvedUrl : getStreamUrl(currentVideo)}
-                autoPlay
-                playsInline
-                loop={playerLoop}
-                onError={() => setPlayerMode('embed')}
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-              />
-            )}
-            <button
-              className="floating-player-open"
-              type="button"
-              onClick={() => switchView('player')}
-              aria-label="再生ページに戻る"
-              title="再生ページに戻る"
-            >
-              <span className="material-icons" style={{ fontSize: '16px' }}>open_in_full</span>
-            </button>
-            <button
-              className="floating-player-close"
-              type="button"
-              onClick={() => setFloatingPlayerVisible(false)}
-              aria-label="閉じる"
-              title="閉じる"
-            >
-              <span className="material-icons" style={{ fontSize: '16px' }}>close</span>
-            </button>
-          </div>
-          <div id="floating-player-info">
-            <div id="floating-player-title" title={currentVideo.title}>{currentVideo.title}</div>
-          </div>
+          {radioMode && playerMode !== 'embed' ? (
+            <div style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '10px', background: '#0f172a', color: '#ffffff' }}>
+              <button
+                type="button"
+                onClick={() => {
+                  const el = audioRef.current;
+                  if (!el) return;
+                  if (el.paused) {
+                    el.play().catch(() => {});
+                  } else {
+                    el.pause();
+                  }
+                }}
+                aria-label={isVideoPlaying ? '一時停止' : '再生'}
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '50%',
+                  border: 'none',
+                  background: '#0284c7',
+                  color: '#ffffff',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  flexShrink: 0
+                }}
+              >
+                <span className="material-icons" style={{ fontSize: '20px' }}>{isVideoPlaying ? 'pause' : 'play_arrow'}</span>
+              </button>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontSize: '10.5px', color: '#7dd3fc', fontWeight: 700 }}>ラジオモード再生中</div>
+                <div style={{ fontSize: '12px', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {currentVideo.title}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => switchView('player')}
+                aria-label="再生ページに戻る"
+                title="再生ページに戻る"
+                style={{ background: 'rgba(255,255,255,0.12)', border: 'none', color: '#fff', borderRadius: '50%', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+              >
+                <span className="material-icons" style={{ fontSize: '16px' }}>open_in_full</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  audioRef.current?.pause();
+                  setFloatingPlayerVisible(false);
+                }}
+                aria-label="停止して閉じる"
+                title="停止して閉じる"
+                style={{ background: 'rgba(255,255,255,0.12)', border: 'none', color: '#fff', borderRadius: '50%', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+              >
+                <span className="material-icons" style={{ fontSize: '16px' }}>close</span>
+              </button>
+            </div>
+          ) : (
+            <>
+              <div id="floating-player-media">
+                {playerMode === 'embed' ? (
+                  <iframe
+                    src={getEmbedUrl(currentVideo)}
+                    style={{ width: '100%', height: '100%', border: 0 }}
+                    allow="autoplay; fullscreen"
+                    title={currentVideo.title}
+                  />
+                ) : (
+                  <video
+                    ref={floatingVideoRef}
+                    src={playerMode === 'freemake' && freemakeResolvedUrl ? freemakeResolvedUrl : getStreamUrl(currentVideo)}
+                    autoPlay
+                    playsInline
+                    loop={playerLoop}
+                    onError={() => setPlayerMode('embed')}
+                    style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                  />
+                )}
+                <button
+                  className="floating-player-open"
+                  type="button"
+                  onClick={() => switchView('player')}
+                  aria-label="再生ページに戻る"
+                  title="再生ページに戻る"
+                >
+                  <span className="material-icons" style={{ fontSize: '16px' }}>open_in_full</span>
+                </button>
+                <button
+                  className="floating-player-close"
+                  type="button"
+                  onClick={() => setFloatingPlayerVisible(false)}
+                  aria-label="閉じる"
+                  title="閉じる"
+                >
+                  <span className="material-icons" style={{ fontSize: '16px' }}>close</span>
+                </button>
+              </div>
+              <div id="floating-player-info">
+                <div id="floating-player-title" title={currentVideo.title}>{currentVideo.title}</div>
+              </div>
+            </>
+          )}
         </aside>
       )}
 
@@ -4041,6 +4827,9 @@ export default function App() {
         >
           <span className="material-icons">subscriptions</span>
           <span>登録</span>
+          {favoriteLiveAlerts.length > 0 && (
+            <span className="bottom-nav-badge">{favoriteLiveAlerts.length}</span>
+          )}
         </div>
         <div
           className={`bottom-nav-item ${currentView === 'playlists' ? 'active' : ''}`}
@@ -4065,6 +4854,9 @@ export default function App() {
         >
           <span className="material-icons">sensors</span>
           <span>探索</span>
+          {favoriteLiveAlerts.length > 0 && (
+            <span className="bottom-nav-badge">L</span>
+          )}
         </div>
         <div
           className={`bottom-nav-item ${currentView === 'settings' ? 'active' : ''}`}
