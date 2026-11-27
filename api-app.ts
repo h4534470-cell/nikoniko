@@ -3773,10 +3773,11 @@ export function createApiApp(): express.Express {
     }
   });
 
-  app.get('/api/nico/live/hls/:id/master.m3u8', async (req, res) => {
+  const handleLiveMasterPlaylist = async (req: express.Request, res: express.Response) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
     const qualityMode = req.query.quality === 'audio_only' ? 'audio_only' : 'high';
     const forceRefresh = req.query.refresh === '1';
+    const workerBase = String(process.env.CF_WORKER_URL || '').replace(/\/+$/, '');
     let sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, qualityMode);
     if (!sess || !sess.streamUri) {
       return res.status(502).json({ error: '生放送ストリームを取得できませんでした' });
@@ -3812,15 +3813,20 @@ export function createApiApp(): express.Express {
         k: sess.cookies.map((c) => ({ n: c.name, v: c.value, p: c.path }))
       });
       const tkQuery = liveTk ? `&tk=${encodeURIComponent(liveTk)}` : '';
+      const useWorkerProxy = Boolean(workerBase && req.path.startsWith('/api/tools/nikoniko'));
+      const viaQuery = useWorkerProxy ? '&via=worker' : '';
+      const proxyBase = useWorkerProxy
+        ? `${workerBase}/live/${encodeURIComponent(cleanId)}/proxy`
+        : '/api/nico/live/hls/proxy';
       text = text.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
         const abs = new URL(uri, base).toString();
-        return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
+        return `${p1}${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}${p3}`;
       });
       text = text.split(/\r?\n/).map((line) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith('#')) {
           const abs = new URL(trimmed, base).toString();
-          return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}`;
+          return `${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}`;
         }
         return line;
       }).join('\n');
@@ -3830,13 +3836,22 @@ export function createApiApp(): express.Express {
     } catch (err: any) {
       return res.status(500).send(err?.message || 'Live HLS error');
     }
-  });
+  };
+
+  app.get('/api/nico/live/hls/:id/master.m3u8', handleLiveMasterPlaylist);
+  app.get('/api/tools/nikoniko/live/:id/master.m3u8', handleLiveMasterPlaylist);
 
   app.get('/api/nico/live/hls/proxy', async (req, res) => {
     const cleanId = sanitizeId(String(req.query.id || '')).toLowerCase();
     const targetUrl = String(req.query.url || '').trim();
     const qualityMode = req.query.quality === 'audio_only' ? 'audio_only' : 'high';
     const rawTk = String(req.query.tk || '');
+    const workerBase = String(process.env.CF_WORKER_URL || '').replace(/\/+$/, '');
+    const useWorkerProxy = Boolean(workerBase && req.query.via === 'worker');
+    const viaQuery = useWorkerProxy ? '&via=worker' : '';
+    const subProxyBase = useWorkerProxy
+      ? `${workerBase}/live/${encodeURIComponent(cleanId)}/proxy`
+      : '/api/nico/live/hls/proxy';
     if (!cleanId || !targetUrl) return res.status(400).send('Missing params');
 
     const sessionKey = `${cleanId}:${qualityMode}`;
@@ -3885,13 +3900,13 @@ export function createApiApp(): express.Express {
         const tkQuery = activeTk ? `&tk=${encodeURIComponent(activeTk)}` : '';
         text = text.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
           const abs = new URL(uri, targetUrl).toString();
-          return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
+          return `${p1}${subProxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}${p3}`;
         });
         text = text.split(/\r?\n/).map((line) => {
           const trimmed = line.trim();
           if (trimmed && !trimmed.startsWith('#')) {
             const abs = new URL(trimmed, targetUrl).toString();
-            return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}`;
+            return `${subProxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}`;
           }
           return line;
         }).join('\n');
