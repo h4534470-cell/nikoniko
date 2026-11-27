@@ -284,12 +284,37 @@ export async function downloadNiconicoInBrowser(opts: {
   }
   const masterText = await masterRes.text();
 
+  const fetchWithRetry = async (url: string, label: string, maxAttempts = 3): Promise<Response> => {
+    let lastStatus = 0;
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      try {
+        const res = await fetch(url, { signal });
+        if (res.ok) return res;
+        lastStatus = res.status;
+        if (attempt < maxAttempts && (res.status === 403 || res.status === 408 || res.status === 429 || res.status >= 500)) {
+          await new Promise((r) => setTimeout(r, attempt * 350));
+          continue;
+        }
+        throw new Error(`${label} (${res.status})`);
+      } catch (err: any) {
+        if (err?.name === 'AbortError' || signal?.aborted) throw err;
+        lastErr = err;
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, attempt * 350));
+          continue;
+        }
+      }
+    }
+    throw lastErr || new Error(`${label} (${lastStatus || 'network'})`);
+  };
+
   const keyCache = new Map<string, CryptoKey>();
   const getCryptoKey = async (keyUrl: string): Promise<CryptoKey> => {
     const existing = keyCache.get(keyUrl);
     if (existing) return existing;
-    const kr = await fetch(keyUrl, { signal });
-    if (!kr.ok) throw new Error('復号鍵の取得に失敗しました');
+    const kr = await fetchWithRetry(keyUrl, '復号鍵の取得に失敗しました');
     const raw = await kr.arrayBuffer();
     const ck = await window.crypto.subtle.importKey('raw', raw, { name: 'AES-CBC' }, false, ['decrypt']);
     keyCache.set(keyUrl, ck);
@@ -305,8 +330,7 @@ export async function downloadNiconicoInBrowser(opts: {
     const parsed = parseMediaPlaylist(playlistText);
     let initBuf: Uint8Array | undefined;
     if (parsed.initUrl) {
-      const ir = await fetch(parsed.initUrl, { signal });
-      if (!ir.ok) throw new Error('初期化セグメントの取得に失敗しました');
+      const ir = await fetchWithRetry(parsed.initUrl, '初期化セグメントの取得に失敗しました');
       initBuf = new Uint8Array(await ir.arrayBuffer());
       downloadedBytes += initBuf.byteLength;
     }
@@ -323,8 +347,7 @@ export async function downloadNiconicoInBrowser(opts: {
         const idx = nextIdx++;
         if (idx >= total) break;
         const seg = parsed.segments[idx];
-        const sr = await fetch(seg.url, { signal });
-        if (!sr.ok) throw new Error(`セグメント取得に失敗しました (${sr.status})`);
+        const sr = await fetchWithRetry(seg.url, 'セグメント取得に失敗しました');
         const rawBuf = await sr.arrayBuffer();
         downloadedBytes += rawBuf.byteLength;
         if (seg.keyUrl && seg.iv) {

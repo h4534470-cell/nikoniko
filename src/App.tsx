@@ -569,6 +569,7 @@ export default function App() {
 
     const startMetadataWatchdog = () => {
       clearStallTimer();
+      const timeoutMs = currentVideo.isLive ? 15000 : 10000;
       stallTimer = window.setTimeout(() => {
         if (cancelled) return;
         const m = radioMode ? audioRef.current : videoRef.current;
@@ -585,7 +586,7 @@ export default function App() {
             setVideoError('ストリームの読み込みがタイムアウトしました。再度お試しください。');
           }
         }
-      }, 10000);
+      }, timeoutMs);
     };
 
     const trySafePlay = (el: HTMLMediaElement) => {
@@ -650,32 +651,70 @@ export default function App() {
             if (!hasNativeMSE && 'ManagedMediaSource' in window && 'disableRemotePlayback' in mediaEl) {
               (mediaEl as HTMLVideoElement).disableRemotePlayback = true;
             }
+            const isLiveStream = Boolean(currentVideo.isLive);
             const hls = new Hls({
               enableWorker: hasNativeMSE,
-              lowLatencyMode: Boolean(currentVideo.isLive),
-              maxBufferLength: 25
+              lowLatencyMode: isLiveStream,
+              ...(isLiveStream
+                ? {
+                    liveSyncDurationCount: 2,
+                    liveMaxLatencyDurationCount: 4,
+                    backBufferLength: 10,
+                    maxBufferLength: 15,
+                    manifestLoadingMaxRetry: 4,
+                    manifestLoadingRetryDelay: 800,
+                    levelLoadingMaxRetry: 4,
+                    levelLoadingRetryDelay: 800,
+                    fragLoadingMaxRetry: 6,
+                    fragLoadingRetryDelay: 600
+                  }
+                : {
+                    maxBufferLength: 25
+                  })
             });
             hlsRef.current = hls;
+            let networkRetries = 0;
+            let mediaRetries = 0;
             hls.loadSource(data.streamUrl);
             hls.attachMedia(mediaEl);
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
               if (cancelled) return;
+              networkRetries = 0;
               setVideoLoadingPercent(100);
               setIsVideoLoading(false);
               trySafePlay(mediaEl);
             });
+            hls.on(Hls.Events.FRAG_BUFFERED, () => {
+              networkRetries = 0;
+              mediaRetries = 0;
+            });
             hls.on(Hls.Events.ERROR, (_event, errData) => {
-              if (errData.fatal && !cancelled) {
-                clearStallTimer();
-                hls.destroy();
-                hlsRef.current = null;
-                setIsVideoLoading(false);
-                if (isNicoTarget && !radioMode) {
-                  setPlayerMode('embed');
-                  showPlayerNotification('公式プレイヤーで再生します');
+              if (!errData.fatal || cancelled) return;
+              if (errData.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 3) {
+                networkRetries++;
+                const code = errData.response?.code;
+                if (isLiveStream && (code === 403 || code === 410 || networkRetries >= 2)) {
+                  const sep = String(data.streamUrl).includes('?') ? '&' : '?';
+                  hls.loadSource(`${data.streamUrl}${sep}refresh=1&_t=${Date.now()}`);
                 } else {
-                  setVideoError('音声・HLSストリームの読み込みに失敗しました。');
+                  hls.startLoad();
                 }
+                return;
+              }
+              if (errData.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 2) {
+                mediaRetries++;
+                hls.recoverMediaError();
+                return;
+              }
+              clearStallTimer();
+              hls.destroy();
+              hlsRef.current = null;
+              setIsVideoLoading(false);
+              if (isNicoTarget && !radioMode) {
+                setPlayerMode('embed');
+                showPlayerNotification('公式プレイヤーで再生します');
+              } else {
+                setVideoError('音声・HLSストリームの読み込みに失敗しました。');
               }
             });
           } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
@@ -703,9 +742,20 @@ export default function App() {
       }
     })();
 
+    let liveHeartbeatTimer: number | null = null;
+    const liveHeartbeatId = (currentVideo.nicoId || currentVideo.id || '').toLowerCase();
+    if (currentVideo.isLive && /^lv\d+$/.test(liveHeartbeatId)) {
+      liveHeartbeatTimer = window.setInterval(() => {
+        fetch(`/api/nico/live/heartbeat/${encodeURIComponent(liveHeartbeatId)}`, { method: 'POST' }).catch(() => {});
+      }, 25000);
+    }
+
     return () => {
       cancelled = true;
       clearStallTimer();
+      if (liveHeartbeatTimer !== null) {
+        window.clearInterval(liveHeartbeatTimer);
+      }
     };
   }, [playerMode, currentVideo?.id, currentView, freemakeQuality, radioMode]);
 

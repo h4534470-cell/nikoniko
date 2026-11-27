@@ -446,6 +446,34 @@ function createApiApp() {
       stage: "ready"
     });
   });
+  const HLS_TOKEN_KEY = crypto.createHash("sha256").update(process.env.HLS_TOKEN_SECRET || process.env.VERCEL_PROJECT_ID || "zero-nico-hls-stateless-key-v1").digest();
+  function sealHlsToken(data) {
+    try {
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv("aes-256-gcm", HLS_TOKEN_KEY, iv);
+      const enc = Buffer.concat([cipher.update(JSON.stringify(data), "utf8"), cipher.final()]);
+      const tag = cipher.getAuthTag();
+      return Buffer.concat([iv, tag, enc]).toString("base64url");
+    } catch {
+      return "";
+    }
+  }
+  function unsealHlsToken(tk) {
+    try {
+      if (!tk || tk.length < 32) return null;
+      const raw = Buffer.from(tk, "base64url");
+      if (raw.length < 28) return null;
+      const iv = raw.subarray(0, 12);
+      const tag = raw.subarray(12, 28);
+      const enc = raw.subarray(28);
+      const decipher = crypto.createDecipheriv("aes-256-gcm", HLS_TOKEN_KEY, iv);
+      decipher.setAuthTag(tag);
+      const dec = Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+      return JSON.parse(dec);
+    } catch {
+      return null;
+    }
+  }
   const nicoHlsSessionCache = /* @__PURE__ */ new Map();
   const nicoHlsInFlight = /* @__PURE__ */ new Map();
   async function getLiveNicoStream(id, quality = "720", forceRefresh = false) {
@@ -563,6 +591,8 @@ Cookie: ${allCookies}\r
       }
       if (!resp.ok) return res.status(resp.status).send("Upstream playlist error");
       let text = await resp.text();
+      const sessionTk = sealHlsToken({ c: session.cookieHeader });
+      const tkQuery = sessionTk ? `&tk=${encodeURIComponent(sessionTk)}` : "";
       if (audioOnly) {
         const audioMatch = text.match(/#EXT-X-MEDIA:[^\r\n]*TYPE=AUDIO[^\r\n]*URI="([^"]+)"/i);
         if (audioMatch?.[1]) {
@@ -579,13 +609,13 @@ Cookie: ${allCookies}\r
             let audioText = await audioResp.text();
             audioText = audioText.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
               const abs = new URL(uri, audioSubUrl).toString();
-              return `${p1}/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}${p3}`;
+              return `${p1}/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
             });
             audioText = audioText.split(/\r?\n/).map((line) => {
               const trimmed = line.trim();
               if (trimmed && !trimmed.startsWith("#")) {
                 const abs = new URL(trimmed, audioSubUrl).toString();
-                return `/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}`;
+                return `/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}`;
               }
               return line;
             }).join("\n");
@@ -597,13 +627,13 @@ Cookie: ${allCookies}\r
       }
       text = text.replace(/(URI=")([^"]+)(")/g, (_match, p1, uri, p3) => {
         const abs = new URL(uri, session.m3u8Url).toString();
-        return `${p1}/api/nico/hls/proxy?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}${p3}`;
+        return `${p1}/api/nico/hls/proxy?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
       });
       text = text.split(/\r?\n/).map((line) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith("#")) {
           const abs = new URL(trimmed, session.m3u8Url).toString();
-          return `/api/nico/hls/proxy?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}`;
+          return `/api/nico/hls/proxy?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}`;
         }
         return line;
       }).join("\n");
@@ -619,28 +649,52 @@ Cookie: ${allCookies}\r
     const id = req.query.id;
     const url = req.query.url;
     const quality = String(req.query.q || "720");
+    const rawTk = String(req.query.tk || "");
     if (!url || !id) return res.status(400).send("Missing params");
-    const session = await getLiveNicoStream(id, quality);
+    const unsealed = rawTk ? unsealHlsToken(rawTk) : null;
+    let cookieHeader = typeof unsealed?.c === "string" ? unsealed.c : "";
+    let activeTk = rawTk;
+    if (!cookieHeader) {
+      const session = await getLiveNicoStream(id, quality);
+      cookieHeader = session ? session.cookieHeader : "";
+      if (cookieHeader) activeTk = sealHlsToken({ c: cookieHeader });
+    }
     try {
-      const resp = await fetch(url, {
+      let resp = await fetch(url, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
           "Referer": "https://www.nicovideo.jp/",
-          "Cookie": session ? session.cookieHeader : ""
+          "Cookie": cookieHeader
         },
         signal: AbortSignal.timeout(8e3)
       });
+      if ((resp.status === 403 || resp.status === 410) && !rawTk) {
+        const refreshed = await getLiveNicoStream(id, quality, true);
+        if (refreshed) {
+          cookieHeader = refreshed.cookieHeader;
+          activeTk = sealHlsToken({ c: cookieHeader });
+          resp = await fetch(url, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+              "Referer": "https://www.nicovideo.jp/",
+              "Cookie": cookieHeader
+            },
+            signal: AbortSignal.timeout(8e3)
+          });
+        }
+      }
       if (!resp.ok) return res.status(resp.status).send("Upstream media playlist error");
       let text = await resp.text();
+      const tkQuery = activeTk ? `&tk=${encodeURIComponent(activeTk)}` : "";
       text = text.replace(/(URI=")([^"]+)(")/g, (_match, p1, uri, p3) => {
         const abs = new URL(uri, url).toString();
-        return `${p1}/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}${p3}`;
+        return `${p1}/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
       });
       text = text.split(/\r?\n/).map((line) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith("#")) {
           const abs = new URL(trimmed, url).toString();
-          return `/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}&url=${encodeURIComponent(abs)}`;
+          return `/api/nico/hls/segment?id=${encodeURIComponent(id)}&q=${encodeURIComponent(quality)}${tkQuery}&url=${encodeURIComponent(abs)}`;
         }
         return line;
       }).join("\n");
@@ -656,21 +710,34 @@ Cookie: ${allCookies}\r
     const id = req.query.id;
     const url = req.query.url;
     const quality = String(req.query.q || "720");
+    const rawTk = String(req.query.tk || "");
     if (!url || !id) return res.status(400).send("Missing params");
-    const session = await getLiveNicoStream(id, quality);
+    const unsealed = rawTk ? unsealHlsToken(rawTk) : null;
+    let cookieHeader = typeof unsealed?.c === "string" ? unsealed.c : "";
+    if (!cookieHeader) {
+      const session = await getLiveNicoStream(id, quality);
+      cookieHeader = session ? session.cookieHeader : "";
+    }
     const headers = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
       "Referer": "https://www.nicovideo.jp/",
       "Origin": "https://www.nicovideo.jp"
     };
-    if (session) {
-      headers["Cookie"] = session.cookieHeader;
+    if (cookieHeader) {
+      headers["Cookie"] = cookieHeader;
     }
     if (req.headers.range) {
       headers["Range"] = req.headers.range;
     }
     try {
-      const resp = await fetch(url, { headers, signal: AbortSignal.timeout(12e3) });
+      let resp = await fetch(url, { headers, signal: AbortSignal.timeout(12e3) });
+      if ((resp.status === 403 || resp.status === 410) && !rawTk) {
+        const refreshed = await getLiveNicoStream(id, quality, true);
+        if (refreshed?.cookieHeader) {
+          headers["Cookie"] = refreshed.cookieHeader;
+          resp = await fetch(url, { headers, signal: AbortSignal.timeout(12e3) });
+        }
+      }
       const buf = Buffer.from(await resp.arrayBuffer());
       res.status(resp.status);
       res.setHeader("Content-Type", resp.headers.get("content-type") || "video/mp4");
@@ -2833,7 +2900,7 @@ Cookie: ${allCookies}\r
                 if (!keepTimer) {
                   keepTimer = setInterval(() => {
                     const cur = nicoLiveSessions.get(sessionKey);
-                    if (!cur || Date.now() - cur.lastActive > 9e4 || ws.readyState !== WebSocket.OPEN) {
+                    if (!cur || Date.now() - cur.lastActive > 18e4 || ws.readyState !== WebSocket.OPEN) {
                       if (keepTimer) clearInterval(keepTimer);
                       try {
                         ws.close();
@@ -2855,6 +2922,11 @@ Cookie: ${allCookies}\r
                   liveSessRef.messageServerViewUri = pendingViewUri;
                 }
               } else if (msg.type === "stream" && msg.data?.uri) {
+                if (liveSessRef) {
+                  liveSessRef.streamUri = String(msg.data.uri);
+                  liveSessRef.cookies = Array.isArray(msg.data.cookies) ? msg.data.cookies : liveSessRef.cookies;
+                  liveSessRef.lastActive = Date.now();
+                }
                 if (!resolved) {
                   resolved = true;
                   clearTimeout(timeout);
@@ -2879,6 +2951,14 @@ Cookie: ${allCookies}\r
                   liveSessRef = sess;
                   nicoLiveSessions.set(sessionKey, sess);
                   resolve(sess);
+                }
+              } else if (msg.type === "reconnect") {
+                if (keepTimer) clearInterval(keepTimer);
+                const cur = nicoLiveSessions.get(sessionKey);
+                if (cur?.ws === ws) nicoLiveSessions.delete(sessionKey);
+                try {
+                  ws.close();
+                } catch {
                 }
               } else if (msg.type === "error" || msg.type === "disconnect") {
                 if (!resolved) {
@@ -2921,6 +3001,23 @@ Cookie: ${allCookies}\r
     nicoLivePending.set(sessionKey, work);
     return work;
   }
+  app2.post("/api/nico/live/heartbeat/:id", async (req, res) => {
+    const cleanId = sanitizeId(req.params.id).toLowerCase();
+    const high = nicoLiveSessions.get(`${cleanId}:high`);
+    const audio = nicoLiveSessions.get(`${cleanId}:audio_only`);
+    const active = high || audio;
+    if (active) {
+      active.lastActive = Date.now();
+      if (active.ws?.readyState === WebSocket.OPEN) {
+        try {
+          active.ws.send(JSON.stringify({ type: "keepSeat" }));
+        } catch {
+        }
+      }
+      return res.json({ success: true, active: true });
+    }
+    return res.json({ success: true, active: false });
+  });
   app2.post("/api/nico/live/stop/:id", (req, res) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
     closeLiveSessionByKey(`${cleanId}:high`);
@@ -3271,7 +3368,8 @@ Cookie: ${allCookies}\r
   app2.get("/api/nico/live/hls/:id/master.m3u8", async (req, res) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
     const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
-    let sess = await getOrCreateNicoLiveSession(cleanId, false, qualityMode);
+    const forceRefresh = req.query.refresh === "1";
+    let sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, qualityMode);
     if (!sess || !sess.streamUri) {
       return res.status(502).json({ error: "\u751F\u653E\u9001\u30B9\u30C8\u30EA\u30FC\u30E0\u3092\u53D6\u5F97\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F" });
     }
@@ -3302,15 +3400,19 @@ Cookie: ${allCookies}\r
       if (!resp.ok) return res.status(resp.status).send("Upstream live playlist error");
       let text = await resp.text();
       const base = sess.streamUri;
+      const liveTk = sealHlsToken({
+        k: sess.cookies.map((c) => ({ n: c.name, v: c.value, p: c.path }))
+      });
+      const tkQuery = liveTk ? `&tk=${encodeURIComponent(liveTk)}` : "";
       text = text.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
         const abs = new URL(uri, base).toString();
-        return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}&url=${encodeURIComponent(abs)}${p3}`;
+        return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
       });
       text = text.split(/\r?\n/).map((line) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith("#")) {
           const abs = new URL(trimmed, base).toString();
-          return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}&url=${encodeURIComponent(abs)}`;
+          return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}`;
         }
         return line;
       }).join("\n");
@@ -3325,33 +3427,59 @@ Cookie: ${allCookies}\r
     const cleanId = sanitizeId(String(req.query.id || "")).toLowerCase();
     const targetUrl = String(req.query.url || "").trim();
     const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
+    const rawTk = String(req.query.tk || "");
     if (!cleanId || !targetUrl) return res.status(400).send("Missing params");
-    const sess = await getOrCreateNicoLiveSession(cleanId, false, qualityMode);
-    if (!sess) return res.status(502).send("No live session");
-    sess.lastActive = Date.now();
+    const sessionKey = `${cleanId}:${qualityMode}`;
+    const existingSess = nicoLiveSessions.get(sessionKey);
+    if (existingSess) {
+      existingSess.lastActive = Date.now();
+    }
+    let cookies = null;
+    let activeTk = rawTk;
+    const unsealed = rawTk ? unsealHlsToken(rawTk) : null;
+    if (Array.isArray(unsealed?.k)) {
+      cookies = unsealed.k.map((c) => ({ name: String(c.n || ""), value: String(c.v || ""), path: c.p ? String(c.p) : void 0 }));
+    } else if (existingSess) {
+      cookies = existingSess.cookies;
+    } else {
+      const sess = await getOrCreateNicoLiveSession(cleanId, false, qualityMode);
+      if (!sess) return res.status(502).send("No live session");
+      sess.lastActive = Date.now();
+      cookies = sess.cookies;
+      activeTk = sealHlsToken({ k: sess.cookies.map((c) => ({ n: c.name, v: c.value, p: c.path })) });
+    }
     try {
       const headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Referer": "https://live.nicovideo.jp/",
-        "Cookie": buildLiveCookieHeader(sess.cookies, targetUrl)
+        "Cookie": buildLiveCookieHeader(cookies, targetUrl)
       };
       if (req.headers.range) {
         headers["Range"] = String(req.headers.range);
       }
-      const resp = await fetch(targetUrl, { headers, signal: AbortSignal.timeout(1e4) });
+      let resp = await fetch(targetUrl, { headers, signal: AbortSignal.timeout(1e4) });
+      if ((resp.status === 403 || resp.status === 410) && !rawTk) {
+        const refreshed = await getOrCreateNicoLiveSession(cleanId, true, qualityMode);
+        if (refreshed) {
+          headers["Cookie"] = buildLiveCookieHeader(refreshed.cookies, targetUrl);
+          activeTk = sealHlsToken({ k: refreshed.cookies.map((c) => ({ n: c.name, v: c.value, p: c.path })) });
+          resp = await fetch(targetUrl, { headers, signal: AbortSignal.timeout(1e4) });
+        }
+      }
       const ct = resp.headers.get("content-type") || "";
       if (ct.includes("mpegurl") || targetUrl.includes(".m3u8")) {
         if (!resp.ok) return res.status(resp.status).send("Upstream live subplaylist error");
         let text = await resp.text();
+        const tkQuery = activeTk ? `&tk=${encodeURIComponent(activeTk)}` : "";
         text = text.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
           const abs = new URL(uri, targetUrl).toString();
-          return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}&url=${encodeURIComponent(abs)}${p3}`;
+          return `${p1}/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}${p3}`;
         });
         text = text.split(/\r?\n/).map((line) => {
           const trimmed = line.trim();
           if (trimmed && !trimmed.startsWith("#")) {
             const abs = new URL(trimmed, targetUrl).toString();
-            return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}&url=${encodeURIComponent(abs)}`;
+            return `/api/nico/live/hls/proxy?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}&url=${encodeURIComponent(abs)}`;
           }
           return line;
         }).join("\n");
