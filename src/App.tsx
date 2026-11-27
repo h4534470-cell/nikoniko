@@ -1804,15 +1804,15 @@ export default function App() {
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* 0. Site Intro (YouTube style intro from muratube) */}
+      {/* 0. Site Intro */}
       {showSiteIntro && (
-        <div id="site-intro" role="status" aria-label="muratube を読み込み中">
+        <div id="site-intro" role="status" aria-label="ZERO-ニコ動 を読み込み中">
           <span className="site-intro-line" aria-hidden="true" />
           <div className="site-intro-mark">
             <span className="site-intro-icon">
               <span className="material-icons" style={{ fontSize: '38px', color: '#fff' }}>play_arrow</span>
             </span>
-            <span className="site-intro-name">muratube</span>
+            <span className="site-intro-name">ZERO-ニコ動</span>
           </div>
         </div>
       )}
