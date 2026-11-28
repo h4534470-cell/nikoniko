@@ -69,9 +69,9 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({
   const triggerFileSave = () => {
     try {
       const cleanTitle = (video.title || 'video').replace(/[\\/:*?"<>|]/g, '_');
-      const filename = `[muraにこ]_${cleanTitle}_${quality}p${includeComments ? '_comments' : ''}.mp4`;
+      const filename = `[ZERO-ニコ動]_${cleanTitle}_${quality}p${includeComments ? '_comments' : ''}.mp4`;
 
-      const dummyContent = `MURA NICO VIDEO MEDIA\nTitle: ${video.title}\nQuality: ${quality}p\nPlatform: niconico\nSource: ${video.url}\nTimestamp: ${new Date().toISOString()}`;
+      const dummyContent = `ZERO NICO VIDEO MEDIA\nTitle: ${video.title}\nQuality: ${quality}p\nPlatform: niconico\nSource: ${video.url}\nTimestamp: ${new Date().toISOString()}`;
       const blob = new Blob([dummyContent], { type: 'video/mp4' });
       const downloadUrl = URL.createObjectURL(blob);
 

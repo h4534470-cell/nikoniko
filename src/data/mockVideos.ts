@@ -620,31 +620,16 @@ export const INITIAL_COMMENTS: VideoComment[] = [
   },
   {
     id: 'c-4',
-    author: 'MuraFan',
+    author: 'NicoViewer',
     author_thumbnail: 'https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?w=80&auto=format&fit=crop&q=80',
-    text: 'muratubeで快適に視聴できて便利です。UIが使いやすくて助かります！',
+    text: 'ZERO-ニコ動で快適に視聴できて便利です。UIが使いやすくて助かります！',
     time: '1週間前',
     likeCount: 78,
     replyCount: 0
   }
 ];
 
-export const INITIAL_NICO_DANMAKU: NicoComment[] = [
-  { id: 'nd-1', text: 'うぽつ！', timeMs: 1200, color: '#ffffff' },
-  { id: 'nd-2', text: '8888888888888888', timeMs: 2500, color: '#ffffff' },
-  { id: 'nd-3', text: '神曲きたあああああああ', timeMs: 4000, color: '#ff5252' },
-  { id: 'nd-4', text: '待ってた！', timeMs: 5500, color: '#63e5ff' },
-  { id: 'nd-5', text: 'ここすき', timeMs: 8200, color: '#fff45c' },
-  { id: 'nd-6', text: '鳥肌たったわ', timeMs: 12000, color: '#6aa9ff' },
-  { id: 'nd-7', text: '職人仕事早すぎだろｗｗｗ', timeMs: 15400, color: '#77ee77' },
-  { id: 'nd-8', text: '草', timeMs: 18200, color: '#ffffff' },
-  { id: 'nd-9', text: '大草原不可避', timeMs: 20100, color: '#77ee77' },
-  { id: 'nd-10', text: '音質良すぎてヘッドホン爆発した', timeMs: 24500, color: '#ff8ec7' },
-  { id: 'nd-11', text: '転調たまらん', timeMs: 29000, color: '#ff9d3d' },
-  { id: 'nd-12', text: 'もう100回は聴いてる', timeMs: 34000, color: '#d18cff' },
-  { id: 'nd-13', text: '神動画認定', timeMs: 40000, color: '#fff45c' },
-  { id: 'nd-14', text: '8888888888888888888888', timeMs: 45000, color: '#ffffff' }
-];
+export const INITIAL_NICO_DANMAKU: NicoComment[] = [];
 
 export const INITIAL_REVIEWS: Review[] = [
   {

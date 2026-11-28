@@ -6,7 +6,7 @@ import https from "https";
 import http from "http";
 import { spawn, spawnSync } from "child_process";
 import crypto from "crypto";
-var NODE_SERVER = process.env.NODE_SERVER || "https://muratube.hospitaldelninodif.gob.mx";
+var NODE_SERVER = process.env.NODE_SERVER || "";
 var IS_VERCEL = Boolean(process.env.VERCEL);
 var YT_DLP_BIN = path.resolve(IS_VERCEL ? "/tmp/bin/yt-dlp" : "bin/yt-dlp");
 var VIDEOS_CACHE_DIR = path.resolve(IS_VERCEL ? "/tmp/videos" : "public/videos");
@@ -238,7 +238,7 @@ function createApiApp() {
     params.set("_sort", sortExpr);
     params.set("_offset", String(offset));
     params.set("_limit", String(limit));
-    params.set("_context", "mura-nico-player");
+    params.set("_context", "zero-nico-player");
     if (opts.genre && opts.genre !== "all" && opts.genre !== "classics") {
       const genreMap = {
         game: "\u30B2\u30FC\u30E0",
@@ -263,7 +263,7 @@ function createApiApp() {
     const url = `https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search?${params.toString()}`;
     const resp = await fetch(url, {
       headers: {
-        "User-Agent": "mura-nico-player/1.0 (https://nicovideo.jp)",
+        "User-Agent": "zero-nico-player/1.0 (https://nicovideo.jp)",
         "Accept": "application/json"
       },
       signal: AbortSignal.timeout(7e3)
@@ -315,7 +315,7 @@ function createApiApp() {
     if (unit === "K") return Math.round(num * 1e3);
     return Math.round(num);
   }
-  const handleMuratubeAction = async (action, req, res) => {
+  const handleApiAction = async (action, req, res) => {
     if (action === "search") {
       const q = String(req.query.q || "").trim();
       const sort = String(req.query.sort || "v");
@@ -403,6 +403,9 @@ function createApiApp() {
     if (!targetUrl) {
       return res.status(400).json({ error: "Invalid action: " + action });
     }
+    if (!NODE_SERVER) {
+      return res.status(503).json({ error: "Relay server not configured" });
+    }
     const client = targetUrl.startsWith("https:") ? https : http;
     const reqHeaders = {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -419,16 +422,16 @@ function createApiApp() {
       proxyRes.pipe(res);
     });
     proxyReq.on("error", (err) => {
-      console.error("Muratube Proxy Error:", err.message);
+      console.error("Relay Proxy Error:", err.message);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Muratube Server Error", detail: err.message });
+        res.status(500).json({ error: "Relay Server Error", detail: err.message });
       }
     });
     proxyReq.end();
   };
   app2.use("/", (req, res, next) => {
     if (req.query.action && typeof req.query.action === "string") {
-      return handleMuratubeAction(req.query.action, req, res);
+      return handleApiAction(req.query.action, req, res);
     }
     next();
   });
@@ -437,7 +440,7 @@ function createApiApp() {
     if (action === "video" || action === "nico" || action === "dl" || action === "download" || action === "freemake") {
       return next();
     }
-    return handleMuratubeAction(action, req, res);
+    return handleApiAction(action, req, res);
   });
   app2.get("/api/video/status/:id", (req, res) => {
     return res.json({
@@ -1758,7 +1761,7 @@ Cookie: ${allCookies}\r
     const safeFormat = allowedFormats.has(format) ? format : "mp4";
     const ext = safeFormat === "iphone" || safeFormat === "android" ? "mp4" : safeFormat;
     const jobId = crypto.randomBytes(8).toString("hex");
-    const dlDir = path.resolve("/tmp/muratube_downloads");
+    const dlDir = path.resolve("/tmp/zero_nico_downloads");
     if (!fs.existsSync(dlDir)) {
       fs.mkdirSync(dlDir, { recursive: true });
     }
@@ -2009,7 +2012,7 @@ Cookie: ${allCookies}\r
       }
       downloadJobs.delete(jobId);
     }
-    const dlDir = path.resolve("/tmp/muratube_downloads");
+    const dlDir = path.resolve("/tmp/zero_nico_downloads");
     if (fs.existsSync(dlDir)) {
       try {
         const files = fs.readdirSync(dlDir).filter((f) => f.startsWith(`${jobId}.`));
@@ -2040,14 +2043,14 @@ Cookie: ${allCookies}\r
     } catch {
       return res.status(400).json({ error: "Invalid URL" });
     }
-    const dlDir = path.resolve("/tmp/muratube_downloads");
+    const dlDir = path.resolve("/tmp/zero_nico_downloads");
     if (!fs.existsSync(dlDir)) {
       fs.mkdirSync(dlDir, { recursive: true });
     }
     const outTemplate = path.join(dlDir, `${safeId}_${quality}_${type}.%(ext)s`);
     const expectedFile = path.join(dlDir, `${safeId}_${quality}_${type}.${ext}`);
     if (fs.existsSync(expectedFile)) {
-      return res.download(expectedFile, `[mura\u306B\u3053]_${safeId}.${ext}`);
+      return res.download(expectedFile, `[ZERO-\u30CB\u30B3\u52D5]_${safeId}.${ext}`);
     }
     try {
       const nicoId = extractNicoIdFromUrl(targetUrl);
@@ -2059,19 +2062,19 @@ Cookie: ${allCookies}\r
           audioOnly: type === "mp3",
           outPath: outBase
         });
-        return res.download(dlRes.filePath, `[mura\u306B\u3053]_${safeId}_${quality}p.${dlRes.ext}`);
+        return res.download(dlRes.filePath, `[ZERO-\u30CB\u30B3\u52D5]_${safeId}_${quality}p.${dlRes.ext}`);
       }
       const ytDlpBin = await ensureYtDlp();
       const args = buildDownloadArgs(targetUrl, type, quality, outTemplate);
       const child = spawn(ytDlpBin, args);
       child.on("close", (code) => {
         if (code === 0 && fs.existsSync(expectedFile)) {
-          return res.download(expectedFile, `[mura\u306B\u3053]_${safeId}_${quality}p.${ext}`);
+          return res.download(expectedFile, `[ZERO-\u30CB\u30B3\u52D5]_${safeId}_${quality}p.${ext}`);
         }
         const files = fs.readdirSync(dlDir);
         const found = files.find((f) => f.startsWith(`${safeId}_${quality}_${type}`) && !f.endsWith(".part"));
         if (found) {
-          return res.download(path.join(dlDir, found), `[mura\u306B\u3053]_${found}`);
+          return res.download(path.join(dlDir, found), `[ZERO-\u30CB\u30B3\u52D5]_${found}`);
         }
         if (!res.headersSent) {
           return res.status(500).json({ error: `yt-dlp download failed (code ${code})` });
@@ -2464,13 +2467,13 @@ Cookie: ${allCookies}\r
           if (rawComments.length > 0) {
             rawComments.sort((a, b) => Number(a.vposMs || 0) - Number(b.vposMs || 0));
             const seen = /* @__PURE__ */ new Set();
-            const comments2 = [];
+            const comments = [];
             for (const c of rawComments) {
               const cid = String(c.id || `${c.vposMs}-${c.body}`);
               if (seen.has(cid)) continue;
               seen.add(cid);
               const parsedCmd = parseNicoCommands(Array.isArray(c.commands) ? c.commands : []);
-              comments2.push({
+              comments.push({
                 id: cid,
                 text: String(c.body),
                 timeMs: Number(c.vposMs || 0),
@@ -2482,42 +2485,16 @@ Cookie: ${allCookies}\r
                 score: Number(c.score || 0),
                 nicoruCount: Number(c.nicoruCount || 0)
               });
-              if (comments2.length >= 250) break;
+              if (comments.length >= 250) break;
             }
-            return res.json({ success: true, source: "nvcomment", count: comments2.length, comments: comments2 });
+            return res.json({ success: true, source: "nvcomment", count: comments.length, comments });
           }
         }
       }
     } catch (err) {
       console.warn("/api/nico/comments nvcomment error:", err);
     }
-    const sampleComments = [
-      "\u3046\u307D\u3064\uFF01",
-      "8888888888888888",
-      "\u795E\u66F2\u304D\u305F\u3042\u3042\u3042\u3042\u3042\u3042",
-      "\u3053\u3053\u3059\u304D",
-      "\u9CE5\u808C\u7ACB\u3063\u305F\u308F",
-      "\u5929\u624D\u304B\u3088",
-      "\u306A\u3064\u304B\u3057\u3044ww",
-      "\u8349",
-      "wwwwwwwwwwww",
-      "\u6700\u9AD8\u3059\u304E\u308B",
-      "\u97F3\u8CEA\u3088\u3059\u304E",
-      "\u4F55\u56DE\u8074\u3044\u3066\u3082\u98FD\u304D\u306A\u3044",
-      "\u6B4C\u8A5E\u304C\u523A\u3055\u308B",
-      "\u3046\u307D\u3064\u3067\u3059\uFF01\uFF01",
-      "\u5F3E\u5E55\u8584\u3044\u305E\u4F55\u3084\u3063\u3066\u3093\u306E\uFF01"
-    ];
-    const comments = sampleComments.map((text, idx) => ({
-      id: `fallback-comment-${idx}`,
-      text,
-      timeMs: idx * 2500,
-      commands: [],
-      color: "#ffffff",
-      position: "naka",
-      size: "medium"
-    }));
-    return res.json({ success: true, source: "fallback", count: comments.length, comments });
+    return res.json({ success: true, source: "nvcomment", count: 0, comments: [] });
   });
   app2.get("/api/nico/video/:id", async (req, res) => {
     const id = sanitizeId(req.params.id);
@@ -3369,7 +3346,7 @@ Cookie: ${allCookies}\r
     const cleanId = sanitizeId(req.params.id).toLowerCase();
     const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
     const forceRefresh = req.query.refresh === "1";
-    const workerBase = String(process.env.CF_WORKER_URL || "").replace(/\/+$/, "");
+    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico.na8526130.workers.dev").replace(/\/+$/, "");
     let sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, qualityMode);
     if (!sess || !sess.streamUri) {
       return res.status(502).json({ error: "\u751F\u653E\u9001\u30B9\u30C8\u30EA\u30FC\u30E0\u3092\u53D6\u5F97\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F" });
@@ -3434,7 +3411,7 @@ Cookie: ${allCookies}\r
     const targetUrl = String(req.query.url || "").trim();
     const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
     const rawTk = String(req.query.tk || "");
-    const workerBase = String(process.env.CF_WORKER_URL || "").replace(/\/+$/, "");
+    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico.na8526130.workers.dev").replace(/\/+$/, "");
     const useWorkerProxy = Boolean(workerBase && req.query.via === "worker");
     const viaQuery = useWorkerProxy ? "&via=worker" : "";
     const subProxyBase = useWorkerProxy ? `${workerBase}/live/${encodeURIComponent(cleanId)}/proxy` : "/api/nico/live/hls/proxy";

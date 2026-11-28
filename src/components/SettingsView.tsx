@@ -17,14 +17,29 @@ export const SettingsView: React.FC = () => {
     setTimeout(() => setSaveAlert(false), 2000);
   };
 
-  const testPing = () => {
+  const testPing = async () => {
     setIsPinging(true);
     setPingStatus('測定中...');
-    setTimeout(() => {
-      const pingMs = Math.floor(Math.random() * 25) + 28;
-      setPingStatus(`自動選択: メインサーバー (${pingMs}ms)。次回の測定まで 58秒`);
+    const targetBase =
+      settings.apiRouteMethod === 'render'
+        ? 'https://nikoniko-4.onrender.com'
+        : settings.apiRouteMethod === 'worker'
+          ? 'https://niconico-2.na8526130.workers.dev'
+          : '';
+    const start = performance.now();
+    try {
+      const resp = await fetch(`${targetBase}/api/health`);
+      const ms = Math.max(1, Math.round(performance.now() - start));
+      setPingStatus(
+        resp.ok
+          ? `接続成功 (${ms}ms): ${targetBase || 'メインサーバー'}`
+          : `応答エラー (HTTP ${resp.status})`
+      );
+    } catch {
+      setPingStatus('接続測定に失敗しました');
+    } finally {
       setIsPinging(false);
-    }, 600);
+    }
   };
 
   return (
@@ -58,11 +73,11 @@ export const SettingsView: React.FC = () => {
             className="w-full p-2.5 rounded-xl border border-[#444] bg-[#1a1a1a] text-white text-xs sm:text-sm outline-none cursor-pointer focus:border-[#0088cc]"
           >
             <option value="auto">
-              自動選択（直通・Render・GASを毎分測定）
+              自動選択（メインサーバー優先）
             </option>
-            <option value="render">Renderを経由する</option>
+            <option value="worker">Cloudflare Worker（東京エッジ中継）</option>
+            <option value="render">Render（常駐APIサーバー）</option>
             <option value="direct">メインサーバー直通</option>
-            <option value="gas">Google Apps Scriptを経由する (予備用)</option>
           </select>
 
           <div className="flex items-center justify-between gap-2 mt-2">
@@ -131,7 +146,7 @@ export const SettingsView: React.FC = () => {
 
         {/* Footer info */}
         <div className="pt-6 border-t border-[#333] flex items-center justify-between text-xs text-zinc-500">
-          <span>muraにこ動画 v2.5</span>
+          <span>ZERO-ニコ動 v2.5</span>
           <span className="text-zinc-500">ニコニコ動画モード専用</span>
         </div>
       </div>

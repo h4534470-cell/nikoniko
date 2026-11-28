@@ -6,7 +6,7 @@ import http from 'http';
 import { spawn, spawnSync, ChildProcess } from 'child_process';
 import crypto from 'crypto';
 
-export const NODE_SERVER = process.env.NODE_SERVER || 'https://muratube.hospitaldelninodif.gob.mx';
+export const NODE_SERVER = process.env.NODE_SERVER || '';
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const YT_DLP_BIN = path.resolve(IS_VERCEL ? '/tmp/bin/yt-dlp' : 'bin/yt-dlp');
 const VIDEOS_CACHE_DIR = path.resolve(IS_VERCEL ? '/tmp/videos' : 'public/videos');
@@ -172,7 +172,7 @@ export function createApiApp(): express.Express {
   app.use(express.json());
   app.use('/videos', express.static(VIDEOS_CACHE_DIR));
 
-  // CORS middleware matching muratube
+  // CORS middleware
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
@@ -243,7 +243,7 @@ export function createApiApp(): express.Express {
     params.set('_sort', sortExpr);
     params.set('_offset', String(offset));
     params.set('_limit', String(limit));
-    params.set('_context', 'mura-nico-player');
+    params.set('_context', 'zero-nico-player');
 
     if (opts.genre && opts.genre !== 'all' && opts.genre !== 'classics') {
       const genreMap: Record<string, string> = {
@@ -271,7 +271,7 @@ export function createApiApp(): express.Express {
     const url = `https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search?${params.toString()}`;
     const resp = await fetch(url, {
       headers: {
-        'User-Agent': 'mura-nico-player/1.0 (https://nicovideo.jp)',
+        'User-Agent': 'zero-nico-player/1.0 (https://nicovideo.jp)',
         'Accept': 'application/json'
       },
       signal: AbortSignal.timeout(7000)
@@ -333,8 +333,8 @@ export function createApiApp(): express.Express {
     return Math.round(num);
   }
 
-  // Proxy handler mirroring https://github.com/kimura38/muratube
-  const handleMuratubeAction = async (action: string, req: express.Request, res: express.Response) => {
+  // Relay action handler
+  const handleApiAction = async (action: string, req: express.Request, res: express.Response) => {
     if (action === 'search') {
       const q = String(req.query.q || '').trim();
       const sort = String(req.query.sort || 'v');
@@ -428,6 +428,9 @@ export function createApiApp(): express.Express {
     if (!targetUrl) {
       return res.status(400).json({ error: 'Invalid action: ' + action });
     }
+    if (!NODE_SERVER) {
+      return res.status(503).json({ error: 'Relay server not configured' });
+    }
 
     const client = targetUrl.startsWith('https:') ? https : http;
     const reqHeaders: Record<string, string | string[] | undefined> = {
@@ -450,19 +453,19 @@ export function createApiApp(): express.Express {
     });
 
     proxyReq.on('error', (err) => {
-      console.error('Muratube Proxy Error:', err.message);
+      console.error('Relay Proxy Error:', err.message);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Muratube Server Error', detail: err.message });
+        res.status(500).json({ error: 'Relay Server Error', detail: err.message });
       }
     });
 
     proxyReq.end();
   };
 
-  // 1. Support root query style matching kimura38/muratube server.js: /?action=...
+  // 1. Support root query style: /?action=...
   app.use('/', (req, res, next) => {
     if (req.query.action && typeof req.query.action === 'string') {
-      return handleMuratubeAction(req.query.action, req, res);
+      return handleApiAction(req.query.action, req, res);
     }
     next();
   });
@@ -474,7 +477,7 @@ export function createApiApp(): express.Express {
     if (action === 'video' || action === 'nico' || action === 'dl' || action === 'download' || action === 'freemake') {
       return next();
     }
-    return handleMuratubeAction(action, req, res);
+    return handleApiAction(action, req, res);
   });
 
   // 3. Fallback / status endpoints for legacy player compatibility
@@ -2001,7 +2004,7 @@ export function createApiApp(): express.Express {
     const ext = safeFormat === 'iphone' || safeFormat === 'android' ? 'mp4' : safeFormat;
     const jobId = crypto.randomBytes(8).toString('hex');
 
-    const dlDir = path.resolve('/tmp/muratube_downloads');
+    const dlDir = path.resolve('/tmp/zero_nico_downloads');
     if (!fs.existsSync(dlDir)) {
       fs.mkdirSync(dlDir, { recursive: true });
     }
@@ -2270,7 +2273,7 @@ export function createApiApp(): express.Express {
       }
       downloadJobs.delete(jobId);
     }
-    const dlDir = path.resolve('/tmp/muratube_downloads');
+    const dlDir = path.resolve('/tmp/zero_nico_downloads');
     if (fs.existsSync(dlDir)) {
       try {
         const files = fs.readdirSync(dlDir).filter((f) => f.startsWith(`${jobId}.`));
@@ -2306,7 +2309,7 @@ export function createApiApp(): express.Express {
       return res.status(400).json({ error: 'Invalid URL' });
     }
 
-    const dlDir = path.resolve('/tmp/muratube_downloads');
+    const dlDir = path.resolve('/tmp/zero_nico_downloads');
     if (!fs.existsSync(dlDir)) {
       fs.mkdirSync(dlDir, { recursive: true });
     }
@@ -2315,7 +2318,7 @@ export function createApiApp(): express.Express {
     const expectedFile = path.join(dlDir, `${safeId}_${quality}_${type}.${ext}`);
 
     if (fs.existsSync(expectedFile)) {
-      return res.download(expectedFile, `[muraにこ]_${safeId}.${ext}`);
+      return res.download(expectedFile, `[ZERO-ニコ動]_${safeId}.${ext}`);
     }
 
     try {
@@ -2328,7 +2331,7 @@ export function createApiApp(): express.Express {
           audioOnly: type === 'mp3',
           outPath: outBase
         });
-        return res.download(dlRes.filePath, `[muraにこ]_${safeId}_${quality}p.${dlRes.ext}`);
+        return res.download(dlRes.filePath, `[ZERO-ニコ動]_${safeId}_${quality}p.${dlRes.ext}`);
       }
 
       const ytDlpBin = await ensureYtDlp();
@@ -2336,12 +2339,12 @@ export function createApiApp(): express.Express {
       const child = spawn(ytDlpBin, args);
       child.on('close', (code) => {
         if (code === 0 && fs.existsSync(expectedFile)) {
-          return res.download(expectedFile, `[muraにこ]_${safeId}_${quality}p.${ext}`);
+          return res.download(expectedFile, `[ZERO-ニコ動]_${safeId}_${quality}p.${ext}`);
         }
         const files = fs.readdirSync(dlDir);
         const found = files.find((f) => f.startsWith(`${safeId}_${quality}_${type}`) && !f.endsWith('.part'));
         if (found) {
-          return res.download(path.join(dlDir, found), `[muraにこ]_${found}`);
+          return res.download(path.join(dlDir, found), `[ZERO-ニコ動]_${found}`);
         }
         if (!res.headersSent) {
           return res.status(500).json({ error: `yt-dlp download failed (code ${code})` });
@@ -2352,7 +2355,7 @@ export function createApiApp(): express.Express {
     }
   });
 
-  // Fallback video catalog when upstream Muratube server returns 502
+  // Fallback video catalog when upstream search is unavailable
   const FALLBACK_VIDEOS = [
     {
       id: 'sm40320938',
@@ -2805,21 +2808,7 @@ export function createApiApp(): express.Express {
       console.warn('/api/nico/comments nvcomment error:', err);
     }
 
-    const sampleComments = [
-      'うぽつ！', '8888888888888888', '神曲きたああああああ', 'ここすき', '鳥肌立ったわ',
-      '天才かよ', 'なつかしいww', '草', 'wwwwwwwwwwww', '最高すぎる',
-      '音質よすぎ', '何回聴いても飽きない', '歌詞が刺さる', 'うぽつです！！', '弾幕薄いぞ何やってんの！'
-    ];
-    const comments = sampleComments.map((text, idx) => ({
-      id: `fallback-comment-${idx}`,
-      text,
-      timeMs: idx * 2500,
-      commands: [],
-      color: '#ffffff',
-      position: 'naka' as const,
-      size: 'medium' as const
-    }));
-    return res.json({ success: true, source: 'fallback', count: comments.length, comments });
+    return res.json({ success: true, source: 'nvcomment', count: 0, comments: [] });
   });
 
   app.get('/api/nico/video/:id', async (req, res) => {
@@ -3777,7 +3766,7 @@ export function createApiApp(): express.Express {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
     const qualityMode = req.query.quality === 'audio_only' ? 'audio_only' : 'high';
     const forceRefresh = req.query.refresh === '1';
-    const workerBase = String(process.env.CF_WORKER_URL || '').replace(/\/+$/, '');
+    const workerBase = String(process.env.CF_WORKER_URL || 'https://niconico-2.na8526130.workers.dev').replace(/\/+$/, '');
     let sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, qualityMode);
     if (!sess || !sess.streamUri) {
       return res.status(502).json({ error: '生放送ストリームを取得できませんでした' });
@@ -3846,7 +3835,7 @@ export function createApiApp(): express.Express {
     const targetUrl = String(req.query.url || '').trim();
     const qualityMode = req.query.quality === 'audio_only' ? 'audio_only' : 'high';
     const rawTk = String(req.query.tk || '');
-    const workerBase = String(process.env.CF_WORKER_URL || '').replace(/\/+$/, '');
+    const workerBase = String(process.env.CF_WORKER_URL || 'https://niconico-2.na8526130.workers.dev').replace(/\/+$/, '');
     const useWorkerProxy = Boolean(workerBase && req.query.via === 'worker');
     const viaQuery = useWorkerProxy ? '&via=worker' : '';
     const subProxyBase = useWorkerProxy

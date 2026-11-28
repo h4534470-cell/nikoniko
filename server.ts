@@ -1,6 +1,6 @@
 import express from 'express';
 import path from 'path';
-import { createApiApp, NODE_SERVER } from './api-app.js';
+import { createApiApp } from './api-app.js';
 
 async function startServer() {
   const app = createApiApp();
@@ -21,7 +21,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on http://0.0.0.0:${PORT} -> ${NODE_SERVER}`);
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

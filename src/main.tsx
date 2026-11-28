@@ -42,7 +42,7 @@ class RootErrorBoundary extends Component<Props, State> {
           textAlign: 'center'
         }}>
           <div style={{ fontSize: '24px', fontWeight: 'bold', marginBottom: '12px' }}>
-            muraにこ動画
+            ZERO-ニコ動
           </div>
           <p style={{ color: '#aaa', fontSize: '14px', maxWidth: '400px', marginBottom: '20px' }}>
             ページの表示中に問題が発生しました。

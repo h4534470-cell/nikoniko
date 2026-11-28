@@ -1,5 +1,5 @@
 import { Video, Playlist, ChannelSubscription, Review, AppSettings, VideoComment, NicoComment } from '../types';
-import { INITIAL_REVIEWS, INITIAL_COMMENTS, INITIAL_NICO_DANMAKU } from '../data/mockVideos';
+import { INITIAL_REVIEWS, INITIAL_COMMENTS } from '../data/mockVideos';
 
 const memoryFallback = new Map<string, string>();
 
@@ -37,19 +37,19 @@ export const safeStorage = {
 };
 
 const KEYS = {
-  TERMS: 'muratubeTermsAccepted_v1',
-  HISTORY: 'muratube_playHistory',
-  SUBSCRIPTIONS: 'muratube_savedSubscriptions',
-  PLAYLISTS: 'muratube_savedPlaylists',
-  REVIEWS: 'muratube_reviews',
-  DEVICE_ID: 'muratube_reviewDeviceId',
-  SETTINGS: 'muratube_settings',
-  VISIT_COUNT: 'muratube_visitCount',
-  COMMENTS_STORE: 'muratube_comments_by_video',
-  DANMAKU_STORE: 'muratube_danmaku_by_video',
-  LIKED_COMMENTS: 'muratube_liked_comments',
-  LIKED_VIDEOS: 'muratube_liked_videos',
-  SEARCH_HISTORY: 'muratube_search_history'
+  TERMS: 'zeroTermsAccepted_v1',
+  HISTORY: 'zero_playHistory',
+  SUBSCRIPTIONS: 'zero_savedSubscriptions',
+  PLAYLISTS: 'zero_savedPlaylists',
+  REVIEWS: 'zero_reviews',
+  DEVICE_ID: 'zero_reviewDeviceId',
+  SETTINGS: 'zero_settings',
+  VISIT_COUNT: 'zero_visitCount',
+  COMMENTS_STORE: 'zero_comments_by_video',
+  DANMAKU_STORE: 'zero_danmaku_by_video',
+  LIKED_COMMENTS: 'zero_liked_comments',
+  LIKED_VIDEOS: 'zero_liked_videos',
+  SEARCH_HISTORY: 'zero_search_history'
 };
 
 export function getSearchHistory(): string[] {
@@ -383,7 +383,7 @@ export function getVideoDanmaku(videoId: string): NicoComment[] {
     const raw = safeStorage.getItem(`${KEYS.DANMAKU_STORE}_${videoId}`);
     if (raw) return JSON.parse(raw);
   } catch {}
-  return INITIAL_NICO_DANMAKU;
+  return [];
 }
 
 export function addDanmakuComment(videoId: string, text: string, timeMs: number, color = '#ffffff'): NicoComment[] {
@@ -449,7 +449,7 @@ export function toggleVideoLike(videoId: string): boolean {
   }
 }
 
-const CUSTOM_VIDEOS_KEY = 'muratube_custom_nico_videos';
+const CUSTOM_VIDEOS_KEY = 'zero_custom_nico_videos';
 
 export function getSavedCustomVideos(): Video[] {
   try {

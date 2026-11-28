@@ -65,6 +65,7 @@ export interface NicoComment {
   size?: 'big' | 'small' | 'medium';
   postedAt?: string;
   score?: number;
+  nicoruCount?: number;
 }
 
 export interface Review {
@@ -124,7 +125,7 @@ export interface LiveChatComment {
 }
 
 export interface AppSettings {
-  apiRouteMethod: 'auto' | 'direct' | 'render' | 'gas';
+  apiRouteMethod: 'auto' | 'direct' | 'render' | 'worker' | 'gas';
   thumbMethod: 'direct' | 'server';
   nicoPlayMethod: 'proxy' | 'direct';
   danmakuSpeed: number; // in seconds, default 8

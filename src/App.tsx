@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Hls from 'hls.js';
-import { Video, ViewType, Review, ChannelSubscription, Playlist, NicoComment, LiveProgram, LiveChatComment } from './types';
+import { Video, ViewType, Review, ChannelSubscription, Playlist, NicoComment, LiveProgram, LiveChatComment, AppSettings } from './types';
 import { INITIAL_VIDEOS, INITIAL_REVIEWS } from './data/mockVideos';
 import { downloadNiconicoInBrowser } from './utils/nicoDownload';
+import { buildApiUrl } from './utils/apiRoute';
 import {
   safeStorage,
   getPlayHistory,
@@ -20,6 +21,7 @@ import {
   getSettings,
   saveSettings,
   getVideoDanmaku,
+  addDanmakuComment,
   getSavedCustomVideos,
   saveCustomVideo,
   getSearchHistory,
@@ -327,6 +329,11 @@ export default function App() {
   const [descExpanded, setDescExpanded] = useState<boolean>(false);
   const [activeDanmaku, setActiveDanmaku] = useState<ActiveDanmakuItem[]>([]);
   const [danmakuPool, setDanmakuPool] = useState<NicoComment[]>([]);
+  const [vodCommentsLoading, setVodCommentsLoading] = useState<boolean>(false);
+  const [vodCommentInput, setVodCommentInput] = useState<string>('');
+  const [vodCommentColor, setVodCommentColor] = useState<string>('#ffffff');
+  const [vodCommentSort, setVodCommentSort] = useState<'time' | 'newest'>('time');
+  const [vodCommentFilter, setVodCommentFilter] = useState<string>('');
   const [liveComments, setLiveComments] = useState<LiveChatComment[]>([]);
   const [liveCommentsLoading, setLiveCommentsLoading] = useState<boolean>(false);
   const seenLiveCommentIdsRef = useRef<Set<string>>(new Set());
@@ -353,7 +360,15 @@ export default function App() {
 
   // Settings
   const [settings, setSettings] = useState(() => getSettings());
-  const [apiRouteStatus, setApiRouteStatus] = useState<string>('メインサーバー を使用中');
+  const apiUrl = (path: string) => buildApiUrl(path, settings.apiRouteMethod);
+  const [apiRouteStatus, setApiRouteStatus] = useState<string>(() => {
+    const initial = getSettings().apiRouteMethod;
+    if (initial === 'worker') return 'Cloudflare Worker (niconico-2.na8526130.workers.dev) を使用中';
+    if (initial === 'render') return 'Render (nikoniko-4.onrender.com) を使用中';
+    return 'メインサーバー を使用中';
+  });
+  const [apiBenchmarks, setApiBenchmarks] = useState<Record<string, { loading: boolean; ms: number | null; ok: boolean | null }>>({});
+  const [isMeasuringApis, setIsMeasuringApis] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<string>(() => safeStorage.getItem('zeroThemeMode') || 'light');
 
   // Download modal & Freemake-style URL Downloader state
@@ -623,7 +638,7 @@ export default function App() {
     (async () => {
       try {
         const resp = await fetch(
-          `/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}`
+          apiUrl(`/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}`)
         );
         const rawText = await resp.text();
         let data: any = null;
@@ -638,13 +653,17 @@ export default function App() {
           throw new Error(data?.error || `ストリーム取得に失敗しました (HTTP ${resp.status})`);
         }
 
+        const resolvedStreamUrl = String(data.streamUrl).startsWith('/')
+          ? apiUrl(String(data.streamUrl))
+          : String(data.streamUrl);
+
         setFreemakeStreamType(data.mode || 'proxy');
-        setFreemakeResolvedUrl(data.streamUrl);
+        setFreemakeResolvedUrl(resolvedStreamUrl);
         setVideoLoadingPercent(85);
         setVideoLoadingStage('再生バッファを開始中...');
         startMetadataWatchdog();
 
-        const isHls = data.mode === 'hls' || String(data.streamUrl).includes('.m3u8');
+        const isHls = data.mode === 'hls' || resolvedStreamUrl.includes('.m3u8');
         if (isHls) {
           if (Hls.isSupported()) {
             const hasNativeMSE = typeof window !== 'undefined' && 'MediaSource' in window;
@@ -675,7 +694,7 @@ export default function App() {
             hlsRef.current = hls;
             let networkRetries = 0;
             let mediaRetries = 0;
-            hls.loadSource(data.streamUrl);
+            hls.loadSource(resolvedStreamUrl);
             hls.attachMedia(mediaEl);
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
               if (cancelled) return;
@@ -694,8 +713,8 @@ export default function App() {
                 networkRetries++;
                 const code = errData.response?.code;
                 if (isLiveStream && (code === 403 || code === 410 || networkRetries >= 2)) {
-                  const sep = String(data.streamUrl).includes('?') ? '&' : '?';
-                  hls.loadSource(`${data.streamUrl}${sep}refresh=1&_t=${Date.now()}`);
+                  const sep = resolvedStreamUrl.includes('?') ? '&' : '?';
+                  hls.loadSource(`${resolvedStreamUrl}${sep}refresh=1&_t=${Date.now()}`);
                 } else {
                   hls.startLoad();
                 }
@@ -718,14 +737,14 @@ export default function App() {
               }
             });
           } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
-            mediaEl.src = data.streamUrl;
+            mediaEl.src = resolvedStreamUrl;
             trySafePlay(mediaEl);
           } else {
-            mediaEl.src = data.streamUrl;
+            mediaEl.src = resolvedStreamUrl;
             trySafePlay(mediaEl);
           }
         } else {
-          mediaEl.src = data.streamUrl;
+          mediaEl.src = resolvedStreamUrl;
           mediaEl.load();
           trySafePlay(mediaEl);
         }
@@ -746,7 +765,7 @@ export default function App() {
     const liveHeartbeatId = (currentVideo.nicoId || currentVideo.id || '').toLowerCase();
     if (currentVideo.isLive && /^lv\d+$/.test(liveHeartbeatId)) {
       liveHeartbeatTimer = window.setInterval(() => {
-        fetch(`/api/nico/live/heartbeat/${encodeURIComponent(liveHeartbeatId)}`, { method: 'POST' }).catch(() => {});
+        fetch(apiUrl(`/api/nico/live/heartbeat/${encodeURIComponent(liveHeartbeatId)}`), { method: 'POST' }).catch(() => {});
       }, 25000);
     }
 
@@ -767,6 +786,42 @@ export default function App() {
     }
     safeStorage.setItem('zeroThemeMode', themeMode);
   }, [themeMode]);
+
+  const measureApiServers = async () => {
+    setIsMeasuringApis(true);
+    const targets: Array<{ id: AppSettings['apiRouteMethod']; url: string }> = [
+      { id: 'auto', url: '/api/health' },
+      { id: 'worker', url: 'https://niconico-2.na8526130.workers.dev/health' },
+      { id: 'render', url: 'https://nikoniko-4.onrender.com/api/health' },
+      { id: 'direct', url: '/api/health' }
+    ];
+    setApiBenchmarks({
+      auto: { loading: true, ms: null, ok: null },
+      worker: { loading: true, ms: null, ok: null },
+      render: { loading: true, ms: null, ok: null },
+      direct: { loading: true, ms: null, ok: null }
+    });
+    await Promise.all(
+      targets.map(async (t) => {
+        const started = performance.now();
+        try {
+          const r = await fetch(t.url, { cache: 'no-store', signal: AbortSignal.timeout(8000) });
+          const ms = Math.max(1, Math.round(performance.now() - started));
+          setApiBenchmarks((prev) => ({ ...prev, [t.id]: { loading: false, ms, ok: r.ok } }));
+        } catch {
+          const ms = Math.max(1, Math.round(performance.now() - started));
+          setApiBenchmarks((prev) => ({ ...prev, [t.id]: { loading: false, ms, ok: false } }));
+        }
+      })
+    );
+    setIsMeasuringApis(false);
+  };
+
+  useEffect(() => {
+    if (currentView === 'settings') {
+      void measureApiServers();
+    }
+  }, [currentView]);
 
   useEffect(() => {
     setPlayHistory(getPlayHistory());
@@ -792,7 +847,7 @@ export default function App() {
     }
     setIsLoadingRanking(true);
     try {
-      const res = await fetch(`/api/nico/ranking?genre=${encodeURIComponent(genre)}&term=${encodeURIComponent(activeTerm)}`);
+      const res = await fetch(apiUrl(`/api/nico/ranking?genre=${encodeURIComponent(genre)}&term=${encodeURIComponent(activeTerm)}`));
       const data = await res.json();
       if (data.success && Array.isArray(data.items) && data.items.length > 0) {
         setRankingVideos(data.items);
@@ -866,7 +921,7 @@ export default function App() {
       if (q) params.set('q', q);
       params.set('sort', sort);
       if (!q && tab && tab !== 'all') params.set('tab', tab);
-      const res = await fetch(`/api/nico/live/search?${params.toString()}`);
+      const res = await fetch(apiUrl(`/api/nico/live/search?${params.toString()}`));
       const rawText = await res.text();
       let data: any = null;
       try {
@@ -927,7 +982,7 @@ export default function App() {
     };
     playVideo(initialVideo, 'freemake');
     try {
-      const res = await fetch(`/api/nico/live/info/${encodeURIComponent(cleanId)}`);
+      const res = await fetch(apiUrl(`/api/nico/live/info/${encodeURIComponent(cleanId)}`));
       const data = await res.json();
       if (data.success && data.program) {
         const prog = data.program;
@@ -1051,26 +1106,21 @@ export default function App() {
     seenLiveCommentIdsRef.current.clear();
     liveCommentsCursorRef.current = 0;
 
-    // Seed initial danmaku while authentic nvcomment loads (skip VOD seed for live streams)
+    // Start with user-posted local danmaku only until authentic nvcomment loads
+    setVodCommentFilter('');
     if (v.isLive) {
       setDanmakuPool([]);
+      setVodCommentsLoading(false);
       setLiveCommentsLoading(true);
     } else {
       setLiveCommentsLoading(false);
-      const baseDanmaku = getVideoDanmaku(v.id);
-      const initialDanmakuList = v.initialDanmaku && v.initialDanmaku.length > 0 ? v.initialDanmaku : [];
-      const seedComments: NicoComment[] = initialDanmakuList.map((text, idx) => ({
-        id: `live-cmt-${v.id}-${idx}`,
-        text,
-        timeMs: (idx * 2000) % 60000,
-        color: ['#ffffff', '#ffffff', '#ffdd00', '#66ccff', '#ff9999', '#77ff77'][idx % 6]
-      }));
-      setDanmakuPool([...seedComments, ...baseDanmaku]);
+      setDanmakuPool(getVideoDanmaku(v.id));
+      setVodCommentsLoading(/^(sm|so|nm)\d+$/i.test(targetNicoId));
     }
 
     // 1. Fetch authentic watch/v3_guest metadata (tags, counts, real owner, description)
     if (/^(sm|so|nm)\d+$/i.test(targetNicoId)) {
-      fetch(`/api/nico/video/${encodeURIComponent(targetNicoId)}`)
+      fetch(apiUrl(`/api/nico/video/${encodeURIComponent(targetNicoId)}`))
         .then((res) => res.json())
         .then((data) => {
           if (data.success && data.video) {
@@ -1089,10 +1139,10 @@ export default function App() {
         .catch(() => {});
 
       // 2. Fetch authentic nvcomment danmaku comments
-      fetch(`/api/nico/comments/${encodeURIComponent(targetNicoId)}`)
+      fetch(apiUrl(`/api/nico/comments/${encodeURIComponent(targetNicoId)}`))
         .then((res) => res.json())
         .then((data) => {
-          if (data.success && Array.isArray(data.comments) && data.comments.length > 0) {
+          if (data.success && Array.isArray(data.comments)) {
             const apiComments: NicoComment[] = data.comments.map((c: any, idx: number) => ({
               id: `nico-live-${c.id}-${idx}`,
               text: c.text,
@@ -1102,15 +1152,19 @@ export default function App() {
               position: c.position || 'naka',
               size: c.size || 'medium',
               postedAt: c.postedAt,
-              score: c.score
+              score: c.score,
+              nicoruCount: Number(c.nicoruCount || 0)
             }));
-            setDanmakuPool(data.source === 'nvcomment' ? apiComments : [...apiComments, ...getVideoDanmaku(v.id)]);
+            setDanmakuPool([...apiComments, ...getVideoDanmaku(v.id)]);
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          setVodCommentsLoading(false);
+        });
 
       // 3. Fetch real nvapi related recommendations
-      fetch(`/api/nico/related/${encodeURIComponent(targetNicoId)}`)
+      fetch(apiUrl(`/api/nico/related/${encodeURIComponent(targetNicoId)}`))
         .then((res) => res.json())
         .then((data) => {
           if (data.success && Array.isArray(data.items)) {
@@ -1120,7 +1174,7 @@ export default function App() {
         .catch(() => {});
 
       // 4. Fetch content tree (親作品・子作品)
-      fetch(`/api/nico/tree/${encodeURIComponent(targetNicoId)}`)
+      fetch(apiUrl(`/api/nico/tree/${encodeURIComponent(targetNicoId)}`))
         .then((res) => res.json())
         .then((data) => {
           if (data.success) {
@@ -1208,7 +1262,7 @@ export default function App() {
     const pollComments = async () => {
       try {
         const cursor = liveCommentsCursorRef.current;
-        const url = `/api/nico/live/comments/${encodeURIComponent(liveId)}${cursor > 0 ? `?since=${cursor}` : ''}`;
+        const url = apiUrl(`/api/nico/live/comments/${encodeURIComponent(liveId)}${cursor > 0 ? `?since=${cursor}` : ''}`);
         const res = await fetch(url);
         const data = await res.json();
         if (cancelled) return;
@@ -1328,7 +1382,7 @@ export default function App() {
       return;
     }
 
-    // Save to muratube search history
+    // Save to search history
     addSearchHistory(raw);
     setSearchHistory(getSearchHistory());
     setIsSearchFocused(false);
@@ -1385,7 +1439,7 @@ export default function App() {
     setIsSearchingOnline(true);
     setOnlineSearchError(null);
     try {
-      const endpoint = `/api/nico/search?q=${encodeURIComponent(raw)}&sort=${sortParam}&order=d&page=${page}`;
+      const endpoint = apiUrl(`/api/nico/search?q=${encodeURIComponent(raw)}&sort=${sortParam}&order=d&page=${page}`);
       const resp = await fetch(endpoint);
       const result = await resp.json();
       if (result.success && Array.isArray(result.items) && result.items.length > 0) {
@@ -1442,6 +1496,91 @@ export default function App() {
       }
     });
   };
+
+  const formatCommentTimeMs = (ms: number) => {
+    const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  };
+
+  const seekToCommentTime = (timeMs: number) => {
+    const activeEl = getActiveMediaEl();
+    if (!activeEl) {
+      showPlayerNotification('公式プレイヤー以外の再生モードでは時間ジャンプに対応しています');
+      return;
+    }
+    const targetSec = Math.max(0, (Number(timeMs) || 0) / 1000);
+    try {
+      activeEl.currentTime = targetSec;
+      if (activeEl.paused) {
+        activeEl.play().catch(() => {});
+      }
+      showPlayerNotification(`${formatCommentTimeMs(timeMs)} に移動しました`);
+    } catch {}
+  };
+
+  const handleSubmitVodComment = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentVideo || currentVideo.isLive) return;
+    const text = vodCommentInput.trim();
+    if (!text) return;
+
+    const activeEl = getActiveMediaEl();
+    const timeMs = activeEl && Number.isFinite(activeEl.currentTime)
+      ? Math.max(0, Math.round(activeEl.currentTime * 1000))
+      : 0;
+    const nowIso = new Date().toISOString();
+    const savedList = addDanmakuComment(currentVideo.id, text, timeMs, vodCommentColor);
+    const latestSaved = savedList[savedList.length - 1];
+    const newItem: NicoComment = {
+      id: latestSaved?.id || `nd-user-${Date.now()}`,
+      text,
+      timeMs,
+      color: vodCommentColor,
+      postedAt: nowIso
+    };
+
+    setDanmakuPool((prev) => [newItem, ...prev]);
+    setVodCommentInput('');
+
+    if (nicoCommentsOn && !radioMode) {
+      const lane = Math.floor(Math.random() * 8);
+      const activeItem: ActiveDanmakuItem = {
+        id: newItem.id,
+        text: newItem.text,
+        topPercent: 4 + lane * 11.5,
+        color: newItem.color || '#ffffff',
+        key: `post-${newItem.id}-${Date.now()}`
+      };
+      setActiveDanmaku((prev) => [...prev, activeItem]);
+      setTimeout(() => {
+        setActiveDanmaku((prev) => prev.filter((d) => d.key !== activeItem.key));
+      }, 7800);
+    }
+    showPlayerNotification('コメントを投稿しました');
+  };
+
+  const visibleVodComments = useMemo(() => {
+    const q = vodCommentFilter.trim().toLowerCase();
+    const list = q
+      ? danmakuPool.filter((c) => c.text.toLowerCase().includes(q))
+      : [...danmakuPool];
+
+    if (vodCommentSort === 'newest') {
+      list.sort((a, b) => {
+        const ta = a.postedAt ? Date.parse(a.postedAt) : 0;
+        const tb = b.postedAt ? Date.parse(b.postedAt) : 0;
+        if (tb !== ta) return tb - ta;
+        return Number(b.timeMs || 0) - Number(a.timeMs || 0);
+      });
+    } else {
+      list.sort((a, b) => Number(a.timeMs || 0) - Number(b.timeMs || 0));
+    }
+    return list;
+  }, [danmakuPool, vodCommentFilter, vodCommentSort]);
 
   const toggleSubscriptionState = (channel: { url: string; name: string; avatar?: string; userId?: string }) => {
     if (!channel.url && !channel.name) return;
@@ -3816,28 +3955,125 @@ export default function App() {
                 </section>
 
                 <section className="settings-section">
-                  <h3 className="settings-section-title"><span className="material-icons">cloud</span>API中継サーバー</h3>
-                  <p className="settings-section-note">読み込みが遅いときは、API中継サーバーを変更できます。</p>
-                  <div className="setting-group">
-                    <label className="setting-label">API中継サーバー</label>
-                    <select
-                      id="apiRouteMethod"
-                      value={settings.apiRouteMethod}
-                      onChange={(e) => {
-                        const updated = { ...settings, apiRouteMethod: e.target.value as any };
-                        setSettings(updated);
-                        saveSettings(updated);
-                        setApiRouteStatus(e.target.value === 'auto' ? '自動選択: メインサーバー (28ms・最速)' : `${e.target.value} を使用中`);
-                      }}
+                  <div className="api-list-header">
+                    <div>
+                      <h3 className="settings-section-title" style={{ marginBottom: '2px' }}>
+                        <span className="material-icons">cloud</span>API中継サーバー一覧
+                      </h3>
+                      <p className="settings-section-note" style={{ marginBottom: 0 }}>
+                        実測の応答速度と用途を比較して接続先を選択できます。
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="api-retest-btn"
+                      onClick={() => void measureApiServers()}
+                      disabled={isMeasuringApis}
                     >
-                      <option value="auto">自動選択（3経路を毎分測定・最速）</option>
-                      <option value="direct">メインサーバー直通（最速）</option>
-                      <option value="render">Render中継（Render Cloud・安定）</option>
-                      <option value="gas">Google Apps Script（予備用）</option>
-                    </select>
-                    <p id="api-route-status" className="api-route-status" aria-live="polite">{apiRouteStatus}</p>
-                    <p className="setting-hint">※動画再生・保存は、途切れを避けるため本体サーバーへ直接接続します。</p>
+                      <span className={`material-icons${isMeasuringApis ? ' spin-icon' : ''}`} style={{ fontSize: '15px' }}>refresh</span>
+                      {isMeasuringApis ? '測定中...' : '速度を再測定'}
+                    </button>
                   </div>
+
+                  <div className="api-route-list" role="radiogroup" aria-label="API中継サーバー一覧">
+                    {[
+                      {
+                        id: 'auto' as const,
+                        name: '自動選択（メインサーバー優先）',
+                        badge: '推奨・標準',
+                        recommended: true,
+                        urlLabel: '同一オリジン (/api/*)',
+                        desc: '通常の検索・動画・コメント取得を最短経路で安定処理します。',
+                        typical: '目安 0.1〜0.5秒'
+                      },
+                      {
+                        id: 'worker' as const,
+                        name: 'Cloudflare Worker（東京エッジ中継）',
+                        badge: '推奨・生放送高速',
+                        recommended: true,
+                        urlLabel: 'https://niconico-2.na8526130.workers.dev',
+                        desc: '東京エッジ経由でHLSセグメントや生放送検索を低遅延中継します。',
+                        typical: '目安 0.05〜0.47秒'
+                      },
+                      {
+                        id: 'render' as const,
+                        name: 'Render（常駐APIサーバー）',
+                        badge: '座席維持対応',
+                        recommended: false,
+                        urlLabel: 'https://nikoniko-4.onrender.com',
+                        desc: '生放送WebSocket（keepSeat）常駐サーバー。15分無通信でスリープします。',
+                        typical: '稼働時 0.36〜1.2秒'
+                      },
+                      {
+                        id: 'direct' as const,
+                        name: 'メインサーバー直通',
+                        badge: 'シンプル',
+                        recommended: false,
+                        urlLabel: '現在のサイト (/api/*)',
+                        desc: '中継を挟まず現在のホストサーバーへ直接アクセスします。',
+                        typical: '目安 0.1〜0.5秒'
+                      }
+                    ].map((srv) => {
+                      const bench = apiBenchmarks[srv.id];
+                      const isActive = settings.apiRouteMethod === srv.id;
+                      const secText = bench?.loading
+                        ? '測定中...'
+                        : bench?.ok === false
+                          ? '応答エラー'
+                          : bench?.ms != null
+                            ? `${(bench.ms / 1000).toFixed(2)}秒`
+                            : '--';
+                      const speedClass = bench?.loading || bench?.ms == null
+                        ? ''
+                        : !bench.ok
+                          ? 'err'
+                          : bench.ms <= 600
+                            ? 'fast'
+                            : 'slow';
+                      return (
+                        <button
+                          key={srv.id}
+                          type="button"
+                          role="radio"
+                          aria-checked={isActive}
+                          className={`api-route-card${isActive ? ' active' : ''}`}
+                          onClick={() => {
+                            const updated = { ...settings, apiRouteMethod: srv.id };
+                            setSettings(updated);
+                            saveSettings(updated);
+                            if (srv.id === 'worker') setApiRouteStatus('Cloudflare Worker (niconico-2.na8526130.workers.dev) を使用中');
+                            else if (srv.id === 'render') setApiRouteStatus('Render (nikoniko-4.onrender.com) を使用中');
+                            else if (srv.id === 'direct') setApiRouteStatus('メインサーバー直通を使用中');
+                            else setApiRouteStatus('自動選択: メインサーバーを使用中');
+                          }}
+                        >
+                          <div className="api-route-main">
+                            <div className="api-route-title-row">
+                              <span className="api-route-name">{srv.name}</span>
+                              <span className={`api-route-badge${srv.recommended ? ' recommended' : ''}`}>
+                                {srv.badge}
+                              </span>
+                              {isActive && (
+                                <span className="api-route-badge recommended">選択中</span>
+                              )}
+                            </div>
+                            <div className="api-route-url">{srv.urlLabel}</div>
+                            <div className="api-route-desc">{srv.desc}</div>
+                          </div>
+                          <div className="api-route-metrics">
+                            <span className={`api-route-time ${speedClass}`}>{secText}</span>
+                            <span className="api-route-sub">
+                              {bench?.ms != null && !bench.loading ? `${bench.ms}ms` : bench?.loading ? '計測中' : '未測定'}
+                            </span>
+                            <span className="api-route-sub">{srv.typical}</span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <p id="api-route-status" className="api-route-status" aria-live="polite">{apiRouteStatus}</p>
+                  <p className="setting-hint">※通常は「自動選択」または「Cloudflare Worker」がおすすめです。</p>
 
                   <div className="setting-group">
                     <label className="setting-label">サムネイルの取得方法</label>
@@ -4341,7 +4577,7 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Loading Overlay matching muratube startLoadingPlayer with Real-time Percentage & Time */}
+                        {/* Loading Overlay with Real-time Percentage & Time */}
                         {isVideoLoading && !videoError && (
                           <div
                             style={{
@@ -4386,7 +4622,7 @@ export default function App() {
                               <span className="material-icons" style={{ fontSize: '18px' }}>close</span>
                             </button>
 
-                            {/* Center sync spinner matching muratube */}
+                            {/* Center sync spinner */}
                             <span className="material-icons spin-icon" style={{ fontSize: '36px', color: '#0088cc', marginBottom: '12px' }}>sync</span>
 
                             {/* Loading message */}
@@ -4399,7 +4635,7 @@ export default function App() {
                               {videoLoadingPercent}%
                             </div>
 
-                            {/* Linear progress bar matching muratube */}
+                            {/* Linear progress bar */}
                             <div style={{ width: 'min(300px, 80vw)', height: '7px', background: 'rgba(255,255,255,0.18)', borderRadius: '4px', overflow: 'hidden', marginBottom: '12px' }}>
                               <div style={{
                                 width: `${Math.max(4, Math.min(100, videoLoadingPercent))}%`,
@@ -4862,6 +5098,128 @@ export default function App() {
                           ))}
                         </div>
                       </div>
+                    )}
+
+                    {/* VOD Comment Section (コメント欄) */}
+                    {!currentVideo.isLive && (
+                      <section className="vod-comments-panel" aria-label="コメント欄">
+                        <div className="vod-comments-header">
+                          <h3 className="vod-comments-title">
+                            <span className="material-icons" style={{ fontSize: '18px', color: 'var(--accent-strong)' }}>comment</span>
+                            コメント欄
+                            <span className="live-chat-count">({visibleVodComments.length}件)</span>
+                          </h3>
+                          <div className="vod-comments-controls">
+                            <button
+                              type="button"
+                              className={`vod-comments-sort-btn${vodCommentSort === 'time' ? ' active' : ''}`}
+                              onClick={() => setVodCommentSort('time')}
+                            >
+                              再生時間順
+                            </button>
+                            <button
+                              type="button"
+                              className={`vod-comments-sort-btn${vodCommentSort === 'newest' ? ' active' : ''}`}
+                              onClick={() => setVodCommentSort('newest')}
+                            >
+                              新しい順
+                            </button>
+                            <input
+                              type="search"
+                              className="vod-comments-filter"
+                              placeholder="コメント検索..."
+                              value={vodCommentFilter}
+                              onChange={(e) => setVodCommentFilter(e.target.value)}
+                              aria-label="コメント検索"
+                            />
+                          </div>
+                        </div>
+
+                        <form className="vod-comment-form" onSubmit={handleSubmitVodComment}>
+                          <input
+                            type="text"
+                            className="vod-comment-input"
+                            placeholder="コメントを追加（現在の再生時間に弾幕として流れます）..."
+                            maxLength={120}
+                            value={vodCommentInput}
+                            onChange={(e) => setVodCommentInput(e.target.value)}
+                          />
+                          <div className="vod-comment-colors" aria-label="コメント色">
+                            {['#ffffff', '#ff5252', '#ffd600', '#38bdf8', '#4ade80'].map((col) => (
+                              <button
+                                key={col}
+                                type="button"
+                                className={`vod-color-dot${vodCommentColor === col ? ' active' : ''}`}
+                                style={{ background: col }}
+                                onClick={() => setVodCommentColor(col)}
+                                aria-label={`色 ${col}`}
+                                title="弾幕カラー"
+                              />
+                            ))}
+                          </div>
+                          <button
+                            type="submit"
+                            className="vod-comment-submit"
+                            disabled={!vodCommentInput.trim()}
+                          >
+                            投稿
+                          </button>
+                        </form>
+
+                        <div className="vod-comments-list">
+                          {vodCommentsLoading && visibleVodComments.length === 0 ? (
+                            <div className="live-chat-empty">コメントを読み込み中...</div>
+                          ) : visibleVodComments.length === 0 ? (
+                            <div className="live-chat-empty">
+                              {vodCommentFilter.trim()
+                                ? '一致するコメントが見つかりませんでした'
+                                : 'コメントはまだありません。最初のコメントを投稿してみましょう！'}
+                            </div>
+                          ) : (
+                            visibleVodComments.slice(0, 200).map((c) => {
+                              const dateLabel = c.postedAt
+                                ? new Date(c.postedAt).toLocaleDateString('ja-JP', { month: 'numeric', day: 'numeric' })
+                                : '';
+                              return (
+                                <div key={c.id} className="vod-comment-row">
+                                  <button
+                                    type="button"
+                                    className="vod-comment-time-btn"
+                                    onClick={() => seekToCommentTime(c.timeMs)}
+                                    title="この再生時間に移動"
+                                  >
+                                    {formatCommentTimeMs(c.timeMs)}
+                                  </button>
+                                  <div className="vod-comment-body">
+                                    {c.color && c.color.toLowerCase() !== '#ffffff' && (
+                                      <span
+                                        style={{
+                                          display: 'inline-block',
+                                          width: '8px',
+                                          height: '8px',
+                                          borderRadius: '50%',
+                                          background: c.color,
+                                          marginRight: '6px',
+                                          verticalAlign: 'middle'
+                                        }}
+                                      />
+                                    )}
+                                    {c.text}
+                                  </div>
+                                  {(dateLabel || (typeof c.nicoruCount === 'number' && c.nicoruCount > 0)) && (
+                                    <div className="vod-comment-meta">
+                                      {typeof c.nicoruCount === 'number' && c.nicoruCount > 0 && (
+                                        <span>👍 {c.nicoruCount}</span>
+                                      )}
+                                      {dateLabel && <span>{dateLabel}</span>}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+                      </section>
                     )}
 
                     {/* Nicopedia Preview Modal */}

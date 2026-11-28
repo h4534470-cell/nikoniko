@@ -45,7 +45,7 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           <span className="font-bold text-lg tracking-tight font-sans">
-            muraにこ動画
+            ZERO-ニコ動
           </span>
 
           <span
