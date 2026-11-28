@@ -2721,6 +2721,130 @@ export function createApiApp(): express.Express {
     return { color, position, size };
   }
 
+  const searchConvertCache = new Map<string, { payload: any; expiresAt: number }>();
+  app.get('/api/search/convert', async (req, res) => {
+    const raw = String(req.query.q || '').trim().slice(0, 120);
+    const hiraQuery = String(req.query.hira || raw).trim().slice(0, 120);
+    if (!raw && !hiraQuery) {
+      return res.json({ ok: true, raw: '', hira: '', primary: '', candidates: [] });
+    }
+
+    const cacheKey = `${raw}::${hiraQuery}`;
+    const now = Date.now();
+    const hit = searchConvertCache.get(cacheKey);
+    if (hit && hit.expiresAt > now) {
+      res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
+      return res.json(hit.payload);
+    }
+
+    const hiraClauses = hiraQuery.split(/\s+/).filter(Boolean).join(',');
+    const hasKana = /[\u3041-\u309f\u30a1-\u30ff]/.test(hiraQuery);
+
+    const fetchIme = async (): Promise<string[]> => {
+      if (!hasKana || !hiraClauses) return [];
+      try {
+        const resp = await fetch(
+          `https://www.google.com/transliterate?langpair=ja-Hira|ja&text=${encodeURIComponent(hiraClauses)}`,
+          { signal: AbortSignal.timeout(2200) }
+        );
+        if (!resp.ok) return [];
+        const data = await resp.json();
+        if (!Array.isArray(data) || data.length === 0) return [];
+        if (data.length === 1 && Array.isArray(data[0]?.[1])) {
+          return data[0][1].map((s: any) => String(s)).filter(Boolean).slice(0, 8);
+        }
+        const hadSpace = /\s/.test(hiraQuery);
+        const sep = hadSpace ? ' ' : '';
+        const out: string[] = [];
+        const segChoices = data.map((seg: any) =>
+          Array.isArray(seg?.[1]) && seg[1].length > 0
+            ? seg[1].map((s: any) => String(s)).filter(Boolean)
+            : [String(seg?.[0] || '')]
+        );
+        // 第1〜第4候補の連結バリエーション
+        for (let k = 0; k < 4; k++) {
+          const joined = segChoices.map((c: string[]) => c[k] || c[0] || '').join(sep).trim();
+          if (joined) out.push(joined);
+          if (!hadSpace) {
+            const spaced = segChoices.map((c: string[]) => c[k] || c[0] || '').join(' ').trim();
+            if (spaced) out.push(spaced);
+          }
+        }
+        // 各文節の2番目以降だけ差し替えたバリエーション
+        for (let sIdx = 0; sIdx < segChoices.length; sIdx++) {
+          for (let altIdx = 1; altIdx < Math.min(4, segChoices[sIdx].length); altIdx++) {
+            const varied = segChoices
+              .map((c: string[], i: number) => (i === sIdx ? c[altIdx] : c[0] || ''))
+              .join(sep)
+              .trim();
+            if (varied) out.push(varied);
+          }
+        }
+        return Array.from(new Set(out)).filter(Boolean).slice(0, 10);
+      } catch {
+        return [];
+      }
+    };
+
+    const fetchNicoSuggest = async (term: string): Promise<string[]> => {
+      if (!term) return [];
+      try {
+        const resp = await fetch(
+          `https://sug.search.nicovideo.jp/suggestion/complete/${encodeURIComponent(term)}`,
+          { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(2200) }
+        );
+        if (!resp.ok) return [];
+        const json = await resp.json();
+        return Array.isArray(json?.candidates)
+          ? json.candidates.map((c: any) => String(c)).filter(Boolean).slice(0, 12)
+          : [];
+      } catch {
+        return [];
+      }
+    };
+
+    const [imeList, nicoFromHira, nicoFromRaw] = await Promise.all([
+      fetchIme(),
+      fetchNicoSuggest(hiraQuery || raw),
+      raw && raw !== hiraQuery ? fetchNicoSuggest(raw) : Promise.resolve([])
+    ]);
+
+    const extraSuggestTargets = Array.from(
+      new Set([imeList[0], imeList[1]].filter((t): t is string => Boolean(t && t !== hiraQuery && t !== raw)))
+    );
+    const nicoFromImeLists = extraSuggestTargets.length > 0
+      ? await Promise.all(extraSuggestTargets.map((t) => fetchNicoSuggest(t)))
+      : [];
+
+    const seen = new Set<string>();
+    const candidates: Array<{ text: string; kind: 'ime' | 'nico' }> = [];
+    const pushCandidate = (text: string, kind: 'ime' | 'nico') => {
+      const clean = String(text || '').trim();
+      if (!clean || seen.has(clean)) return;
+      seen.add(clean);
+      candidates.push({ text: clean, kind });
+    };
+
+    imeList.slice(0, 8).forEach((t) => pushCandidate(t, 'ime'));
+    nicoFromImeLists.forEach((arr) => arr.forEach((t) => pushCandidate(t, 'nico')));
+    nicoFromHira.forEach((t) => pushCandidate(t, 'nico'));
+    nicoFromRaw.forEach((t) => pushCandidate(t, 'nico'));
+
+    const primary = imeList[0] || nicoFromHira[0] || nicoFromRaw[0] || hiraQuery || raw;
+    const payload = {
+      ok: true,
+      raw,
+      hira: hiraQuery,
+      primary,
+      candidates: candidates.slice(0, 25)
+    };
+
+    if (searchConvertCache.size > 300) searchConvertCache.clear();
+    searchConvertCache.set(cacheKey, { payload, expiresAt: now + 5 * 60 * 1000 });
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
+    return res.json(payload);
+  });
+
   app.get('/api/nico/search', async (req, res) => {
     const q = ((req.query.q as string) || '').trim();
     const sort = ((req.query.sort as string) || 'v').trim();
@@ -2832,6 +2956,134 @@ export function createApiApp(): express.Express {
     return res.json({ success: true, items: FALLBACK_VIDEOS, total: FALLBACK_VIDEOS.length });
   });
 
+  const subtitleCache = new Map<string, { payload: any; expiresAt: number }>();
+
+  const json3ToVtt = (jsonText: string): string => {
+    try {
+      const parsed = JSON.parse(jsonText);
+      const events = Array.isArray(parsed?.events) ? parsed.events : [];
+      const lines: string[] = ['WEBVTT', ''];
+      let idx = 1;
+      const fmt = (ms: number) => {
+        const s = Math.max(0, Math.round(ms));
+        const hh = Math.floor(s / 3600000);
+        const mm = Math.floor((s % 3600000) / 60000);
+        const ss = Math.floor((s % 60000) / 1000);
+        const rem = s % 1000;
+        return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}.${String(rem).padStart(3, '0')}`;
+      };
+      for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        const segs = Array.isArray(ev?.segs) ? ev.segs : [];
+        const text = segs.map((s: any) => String(s?.utf8 || '')).join('').replace(/\s+\n/g, '\n').trim();
+        if (!text || text === '\n') continue;
+        const startMs = Number(ev.tStartMs || 0);
+        const nextStart = events[i + 1]?.tStartMs ? Number(events[i + 1].tStartMs) : startMs + 3500;
+        const durMs = Math.min(Number(ev.dDurationMs || 3500), Math.max(1200, nextStart - startMs));
+        lines.push(String(idx++));
+        lines.push(`${fmt(startMs)} --> ${fmt(startMs + durMs)}`);
+        lines.push(text);
+        lines.push('');
+      }
+      return idx > 1 ? lines.join('\n') : '';
+    } catch {
+      return '';
+    }
+  };
+
+  app.get('/api/subtitles', async (req, res) => {
+    const rawUrl = String(req.query.url || '').trim();
+    if (!rawUrl) {
+      return res.json({ ok: false, error: 'URLが必要です', vtt: '' });
+    }
+    let targetUrl = '';
+    try {
+      targetUrl = normalizeTargetUrl(rawUrl);
+    } catch {
+      return res.json({ ok: false, error: '無効なURL', vtt: '' });
+    }
+
+    const now = Date.now();
+    const cached = subtitleCache.get(targetUrl);
+    if (cached && cached.expiresAt > now) {
+      return res.json(cached.payload);
+    }
+
+    // Niconico動画は nvcomment の投稿者・職人コメントを高精度字幕として使用するためスキップ
+    if (extractNicoIdFromUrl(targetUrl)) {
+      return res.json({ ok: true, source: 'nico-comments', lang: 'ja', vtt: '' });
+    }
+
+    try {
+      const ytDlpBin = await ensureYtDlp();
+      const rawJson = await new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        const proc = spawn(ytDlpBin, ['-J', '--no-playlist', '--no-warnings', targetUrl]);
+        const timer = setTimeout(() => {
+          proc.kill('SIGKILL');
+          reject(new Error('timeout'));
+        }, 18000);
+        proc.stdout.on('data', (d) => chunks.push(d));
+        proc.on('close', (code) => {
+          clearTimeout(timer);
+          if (code === 0) resolve(Buffer.concat(chunks).toString('utf8'));
+          else reject(new Error(`yt-dlp code ${code}`));
+        });
+        proc.on('error', (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+
+      const info = JSON.parse(rawJson);
+      const entry = Array.isArray(info?.entries) && info.entries[0] ? info.entries[0] : info;
+      const pickTrack = (subsObj: Record<string, any> | undefined, sourceKind: 'official' | 'auto-caption') => {
+        if (!subsObj || typeof subsObj !== 'object') return null;
+        const langOrder = ['ja', 'ja-JP', 'ja-orig', 'en', 'en-US', 'en-orig', ...Object.keys(subsObj)];
+        for (const lang of langOrder) {
+          const tracks = subsObj[lang];
+          if (!Array.isArray(tracks) || tracks.length === 0) continue;
+          const vttTrack = tracks.find((t: any) => t?.ext === 'vtt' && t?.url)
+            || tracks.find((t: any) => t?.ext === 'srt' && t?.url)
+            || tracks.find((t: any) => t?.ext === 'json3' && t?.url)
+            || tracks.find((t: any) => t?.url);
+          if (vttTrack?.url) {
+            return { lang, ext: String(vttTrack.ext || 'vtt'), url: String(vttTrack.url), source: sourceKind };
+          }
+        }
+        return null;
+      };
+
+      const picked = pickTrack(entry?.subtitles, 'official') || pickTrack(entry?.automatic_captions, 'auto-caption');
+      if (!picked) {
+        const payload = { ok: true, source: 'none', lang: '', vtt: '' };
+        subtitleCache.set(targetUrl, { payload, expiresAt: now + 10 * 60 * 1000 });
+        return res.json(payload);
+      }
+
+      const subResp = await fetch(picked.url, { signal: AbortSignal.timeout(8000) });
+      if (!subResp.ok) {
+        return res.json({ ok: false, error: '字幕データの取得に失敗しました', vtt: '' });
+      }
+      const rawText = await subResp.text();
+      const vttText = picked.ext === 'json3' || rawText.trim().startsWith('{')
+        ? json3ToVtt(rawText)
+        : rawText;
+
+      const payload = {
+        ok: Boolean(vttText),
+        source: picked.source,
+        lang: picked.lang,
+        vtt: vttText
+      };
+      if (subtitleCache.size > 100) subtitleCache.clear();
+      subtitleCache.set(targetUrl, { payload, expiresAt: now + 15 * 60 * 1000 });
+      return res.json(payload);
+    } catch (err: any) {
+      return res.json({ ok: false, error: err?.message || '字幕取得エラー', vtt: '' });
+    }
+  });
+
   app.get('/api/nico/comments/:id', async (req, res) => {
     const id = sanitizeId(req.params.id);
 
@@ -2858,19 +3110,26 @@ export function createApiApp(): express.Express {
           const threads: any[] = Array.isArray(cJson?.data?.threads) ? cJson.data.threads : [];
           const rawComments: any[] = [];
           for (const th of threads) {
+            const forkName = String(th?.fork || 'main');
             if (Array.isArray(th.comments)) {
               for (const c of th.comments) {
                 if (typeof c.score === 'number' && c.score <= -10000) continue; // filter extreme NG spam
                 if (!c.body) continue;
-                rawComments.push(c);
+                rawComments.push({ ...c, __fork: forkName });
               }
             }
           }
           if (rawComments.length > 0) {
-            rawComments.sort((a, b) => Number(a.vposMs || 0) - Number(b.vposMs || 0));
+            // 投稿者コメント(owner)を落とさず時刻順に保持
+            const ownerList = rawComments.filter((c) => c.__fork === 'owner');
+            const otherList = rawComments.filter((c) => c.__fork !== 'owner');
+            otherList.sort((a, b) => Number(a.vposMs || 0) - Number(b.vposMs || 0));
+            const merged = [...ownerList, ...otherList.slice(0, Math.max(0, 400 - ownerList.length))];
+            merged.sort((a, b) => Number(a.vposMs || 0) - Number(b.vposMs || 0));
+
             const seen = new Set<string>();
             const comments = [];
-            for (const c of rawComments) {
+            for (const c of merged) {
               const cid = String(c.id || `${c.vposMs}-${c.body}`);
               if (seen.has(cid)) continue;
               seen.add(cid);
@@ -2885,9 +3144,9 @@ export function createApiApp(): express.Express {
                 size: parsedCmd.size,
                 postedAt: c.postedAt || '',
                 score: Number(c.score || 0),
-                nicoruCount: Number(c.nicoruCount || 0)
+                nicoruCount: Number(c.nicoruCount || 0),
+                fork: c.__fork || 'main'
               });
-              if (comments.length >= 250) break;
             }
             return res.json({ success: true, source: 'nvcomment', count: comments.length, comments });
           }

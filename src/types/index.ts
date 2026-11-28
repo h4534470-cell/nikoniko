@@ -66,6 +66,7 @@ export interface NicoComment {
   postedAt?: string;
   score?: number;
   nicoruCount?: number;
+  fork?: string;
 }
 
 export interface Review {

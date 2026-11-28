@@ -5,8 +5,8 @@ import { INITIAL_VIDEOS, INITIAL_REVIEWS } from './data/mockVideos';
 import { downloadNiconicoInBrowser } from './utils/nicoDownload';
 import { buildApiUrl, apiFetch, getAutoNodeDisplayInfo, rerollAutoNode, getLiveViewerId, getConfiguredVercelUrl, RENDER_SERVER_URLS, QUOTA_EXCEEDED_EVENT, QUOTA_EXCEEDED_MESSAGE, LIVE_CAPACITY_FULL_MESSAGE } from './utils/apiRoute';
 import { ThumbImg, resolveThumbnailDataUrl } from './components/ThumbImg';
-import { convertSearchQuery, SearchConversionResult } from './utils/searchQuery';
-import { SubtitleCue, parseSubtitleFileText, buildAutoSubtitlesFromComments, createVttBlobUrl } from './utils/subtitles';
+import { convertSearchQuery, toSearchHiragana, getLocalSearchSuggestions, getLocalKanjiCandidates, SearchConversionResult } from './utils/searchQuery';
+import { SubtitleCue, parseSubtitleFileText, buildAutoSubtitlesFromComments, buildFullscreenDanmakuCues, findActiveSubtitleText, createVttBlobUrl } from './utils/subtitles';
 import {
   safeStorage,
   getPlayHistory,
@@ -26,11 +26,7 @@ import {
   getVideoDanmaku,
   addDanmakuComment,
   getSavedCustomVideos,
-  saveCustomVideo,
-  getSearchHistory,
-  addSearchHistory,
-  removeSearchHistory,
-  clearSearchHistory
+  saveCustomVideo
 } from './utils/storage';
 
 interface ActiveDanmakuItem {
@@ -157,9 +153,12 @@ export default function App() {
   const [videoPlayPercent, setVideoPlayPercent] = useState<number>(0);
   const [videoBufferPercent, setVideoBufferPercent] = useState<number>(0);
 
-  // Search History & Intro state
-  const [searchHistory, setSearchHistory] = useState<string[]>(() => getSearchHistory());
+  // Live Search Conversion state
   const [isSearchFocused, setIsSearchFocused] = useState<boolean>(false);
+  const [remoteConvertCandidates, setRemoteConvertCandidates] = useState<Array<{ text: string; kind: 'ime' | 'nico' }>>([]);
+  const [isFetchingConvert, setIsFetchingConvert] = useState<boolean>(false);
+  const [activeConvertIdx, setActiveConvertIdx] = useState<number>(-1);
+  const convertCacheRef = useRef<Map<string, { primary: string; candidates: Array<{ text: string; kind: 'ime' | 'nico' }> }>>(new Map());
   const [showSiteIntro] = useState<boolean>(false);
 
   const formatLoadingDuration = (seconds: number) => {
@@ -366,10 +365,57 @@ export default function App() {
   // Settings & Distributed Route State
   const [settings, setSettings] = useState(() => getSettings());
   const autoPlayRef = useRef<boolean>(settings.autoPlay !== false);
+  const userPausedRef = useRef<boolean>(false);
+  const [isAutoMutedFallback, setIsAutoMutedFallback] = useState<boolean>(false);
+  const [nextAutoPlayState, setNextAutoPlayState] = useState<{ nextVideo: Video; secondsLeft: number } | null>(null);
   useEffect(() => {
     autoPlayRef.current = settings.autoPlay !== false;
   }, [settings.autoPlay]);
+
+  const attemptAutoPlay = async (el: HTMLMediaElement | null, preferUnmuted: boolean = true): Promise<boolean> => {
+    if (!el) return false;
+    if (!autoPlayRef.current || userPausedRef.current) {
+      if (!autoPlayRef.current && !el.paused) {
+        el.pause();
+      }
+      setIsVideoPlaying(false);
+      return false;
+    }
+    el.autoplay = true;
+    try {
+      if (preferUnmuted) {
+        el.muted = false;
+      }
+      await el.play();
+      setIsVideoPlaying(true);
+      setIsVideoLoading(false);
+      setVideoLoadingPercent(100);
+      setIsAutoMutedFallback(el.muted);
+      return true;
+    } catch {
+      if (!radioMode) {
+        try {
+          el.muted = true;
+          el.defaultMuted = true;
+          await el.play();
+          setIsVideoPlaying(true);
+          setIsVideoLoading(false);
+          setVideoLoadingPercent(100);
+          setIsAutoMutedFallback(true);
+          return true;
+        } catch {
+          setIsVideoPlaying(false);
+          return false;
+        }
+      }
+      setIsVideoPlaying(false);
+      return false;
+    }
+  };
   const [customSubtitles, setCustomSubtitles] = useState<SubtitleCue[] | null>(null);
+  const [fetchedSubtitles, setFetchedSubtitles] = useState<SubtitleCue[] | null>(null);
+  const [fetchedSubtitleLabel, setFetchedSubtitleLabel] = useState<string>('');
+  const [subtitleOffsetMs, setSubtitleOffsetMs] = useState<number>(0);
   const [activeSubtitleText, setActiveSubtitleText] = useState<string>('');
   const [searchConversion, setSearchConversion] = useState<SearchConversionResult | null>(null);
   const [vercelUrlDraft, setVercelUrlDraft] = useState<string>(() => getSettings().vercelApiUrl || '');
@@ -396,11 +442,169 @@ export default function App() {
   const autoPlayEnabled = settings.autoPlay !== false;
   const searchConvertEnabled = settings.searchConvertEnabled !== false;
 
-  const activeSubtitleCues = useMemo<SubtitleCue[]>(() => {
-    if (customSubtitles && customSubtitles.length > 0) return customSubtitles;
-    if (!currentVideo || currentVideo.isLive) return [];
-    return buildAutoSubtitlesFromComments(danmakuPool);
-  }, [customSubtitles, currentVideo?.id, currentVideo?.isLive, danmakuPool]);
+  const fetchSearchConvertWithFallback = async (
+    q: string,
+    hira: string,
+    signal?: AbortSignal
+  ): Promise<{ primary: string; candidates: Array<{ text: string; kind: 'ime' | 'nico' }> }> => {
+    const path = `/api/search/convert?q=${encodeURIComponent(q)}&hira=${encodeURIComponent(hira)}`;
+    const parsePayload = (data: any) => {
+      const cands: Array<{ text: string; kind: 'ime' | 'nico' }> = Array.isArray(data?.candidates)
+        ? data.candidates
+            .filter((c: any) => c && typeof c.text === 'string' && c.text.trim())
+            .map((c: any) => ({
+              text: c.text.trim(),
+              kind: c.kind === 'ime' ? 'ime' : 'nico'
+            }))
+        : [];
+      return { primary: String(data?.primary || '').trim(), candidates: cands };
+    };
+
+    // 同一オリジンAPIは最新の /api/search/convert を常に持つため auto/direct では最優先
+    const trySameOrigin = async () => {
+      const res = await fetch(path, { signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parsePayload(await res.json());
+    };
+    const tryRoutedApi = async () => {
+      const res = await apiCall(path, { signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parsePayload(await res.json());
+    };
+
+    if (settings.apiRouteMethod === 'auto' || settings.apiRouteMethod === 'direct') {
+      try {
+        const localRes = await trySameOrigin();
+        if (localRes.candidates.length > 0) return localRes;
+      } catch {}
+      try {
+        return await tryRoutedApi();
+      } catch {
+        return { primary: '', candidates: [] };
+      }
+    }
+
+    try {
+      const routedRes = await tryRoutedApi();
+      if (routedRes.candidates.some((c) => c.kind === 'ime')) return routedRes;
+    } catch {}
+    try {
+      return await trySameOrigin();
+    } catch {
+      return { primary: '', candidates: [] };
+    }
+  };
+
+  useEffect(() => {
+    const q = searchQuery.trim();
+    setActiveConvertIdx(-1);
+    if (!q || !searchConvertEnabled || /^https?:\/\//i.test(q) || /^(sm|so|nm|lv)\d+$/i.test(q)) {
+      setRemoteConvertCandidates([]);
+      setIsFetchingConvert(false);
+      return;
+    }
+
+    const localConv = convertSearchQuery(q, true);
+    const hira = localConv.hiraText || toSearchHiragana(q);
+    const cacheKey = `${q}::${hira}`;
+    const cached = convertCacheRef.current.get(cacheKey);
+    if (cached) {
+      setRemoteConvertCandidates(cached.candidates);
+      setIsFetchingConvert(false);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setIsFetchingConvert(true);
+
+    const timer = window.setTimeout(async () => {
+      try {
+        const entry = await fetchSearchConvertWithFallback(q, hira, controller.signal);
+        if (cancelled) return;
+        if (entry.candidates.length > 0) {
+          if (convertCacheRef.current.size > 150) convertCacheRef.current.clear();
+          convertCacheRef.current.set(cacheKey, entry);
+        }
+        setRemoteConvertCandidates(entry.candidates);
+      } catch {
+        if (!cancelled) {
+          setRemoteConvertCandidates([]);
+        }
+      } finally {
+        if (!cancelled) setIsFetchingConvert(false);
+      }
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [searchQuery, searchConvertEnabled, settings.apiRouteMethod]);
+
+  const searchDropdownCandidates = useMemo(() => {
+    const raw = searchQuery.trim();
+    if (!raw || !searchConvertEnabled) return [];
+    const localConv = convertSearchQuery(raw, true);
+    const localKanji = getLocalKanjiCandidates(raw, 10);
+    const localSuggests = getLocalSearchSuggestions(raw, 12);
+    const list: Array<{ text: string; kind: 'dict' | 'ime' | 'nico' | 'kana'; badge: string }> = [];
+    const seen = new Set<string>();
+    const push = (text: string, kind: 'dict' | 'ime' | 'nico' | 'kana', badge: string) => {
+      const clean = String(text || '').trim();
+      if (!clean || seen.has(clean)) return;
+      seen.add(clean);
+      list.push({ text: clean, kind, badge });
+    };
+
+    if (localConv.wasConverted && localConv.reason === 'キーワード変換') {
+      push(localConv.converted, 'dict', '最適変換');
+    }
+
+    for (const rc of remoteConvertCandidates) {
+      if (rc.kind === 'ime') push(rc.text, 'ime', '漢字変換');
+    }
+
+    for (const lk of localKanji) {
+      push(lk, 'ime', '漢字変換');
+    }
+
+    for (const ls of localSuggests) {
+      push(ls, 'dict', '関連語');
+    }
+
+    for (const rc of remoteConvertCandidates) {
+      if (rc.kind !== 'ime') push(rc.text, 'nico', 'ニコニコ候補');
+    }
+
+    if (localConv.wasConverted) {
+      push(localConv.converted, 'kana', localConv.reason === '動画/生放送IDを抽出' ? 'ID抽出' : 'かな変換');
+    }
+
+    for (const alt of localConv.alternatives) {
+      push(alt, 'kana', '表記候補');
+    }
+
+    return list.slice(0, 20);
+  }, [searchQuery, searchConvertEnabled, remoteConvertCandidates]);
+
+  const activeSubtitleInfo = useMemo<{ cues: SubtitleCue[]; sourceLabel: string }>(() => {
+    if (customSubtitles && customSubtitles.length > 0) {
+      return { cues: customSubtitles, sourceLabel: '読込字幕ファイル' };
+    }
+    if (fetchedSubtitles && fetchedSubtitles.length > 0) {
+      return { cues: fetchedSubtitles, sourceLabel: fetchedSubtitleLabel || '公式/自動字幕' };
+    }
+    if (!currentVideo || currentVideo.isLive) {
+      return { cues: [], sourceLabel: '' };
+    }
+    const built = buildAutoSubtitlesFromComments(danmakuPool);
+    return { cues: built.cues, sourceLabel: built.modeLabel };
+  }, [customSubtitles, fetchedSubtitles, fetchedSubtitleLabel, currentVideo?.id, currentVideo?.isLive, danmakuPool]);
+
+  const activeSubtitleCues = activeSubtitleInfo.cues;
+  const activeSubtitleSourceLabel = activeSubtitleInfo.sourceLabel;
 
   const [subtitleVttUrl, setSubtitleVttUrl] = useState<string | null>(null);
   useEffect(() => {
@@ -408,14 +612,292 @@ export default function App() {
       setSubtitleVttUrl(null);
       return;
     }
-    const url = createVttBlobUrl(activeSubtitleCues);
+    const url = createVttBlobUrl(activeSubtitleCues, subtitleOffsetMs);
     setSubtitleVttUrl(url);
     return () => {
       try {
         URL.revokeObjectURL(url);
       } catch {}
     };
-  }, [subtitleEnabled, activeSubtitleCues]);
+  }, [subtitleEnabled, activeSubtitleCues, subtitleOffsetMs]);
+
+  const [fullscreenMode, setFullscreenMode] = useState<'none' | 'container' | 'native-video'>('none');
+  const fullscreenModeRef = useRef<'none' | 'container' | 'native-video'>('none');
+  useEffect(() => {
+    fullscreenModeRef.current = fullscreenMode;
+  }, [fullscreenMode]);
+
+  const fullscreenCommentTrackRef = useRef<TextTrack | null>(null);
+  const injectedLiveFullscreenIdsRef = useRef<Set<string>>(new Set());
+
+  const ensureFullscreenTrack = (vid: HTMLVideoElement): TextTrack | null => {
+    try {
+      const existingTracks = Array.from(vid.textTracks || []);
+      let track = fullscreenCommentTrackRef.current;
+      if (!track || !existingTracks.includes(track)) {
+        track = vid.addTextTrack('captions', '弾幕コメント', 'ja');
+        track.mode = 'disabled';
+        fullscreenCommentTrackRef.current = track;
+      }
+      return track;
+    } catch {
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    const syncFullscreenState = () => {
+      const fsEl =
+        document.fullscreenElement ||
+        (document as any).webkitFullscreenElement ||
+        (document as any).mozFullScreenElement ||
+        (document as any).msFullscreenElement;
+      const vid = videoRef.current as any;
+      const container = videoContainerRef.current as any;
+
+      if (
+        vid &&
+        (fsEl === vid ||
+          Boolean(vid.webkitDisplayingFullscreen) ||
+          vid.webkitPresentationMode === 'fullscreen')
+      ) {
+        setFullscreenMode('native-video');
+      } else if (fsEl && container && (fsEl === container || fsEl.contains(container))) {
+        setFullscreenMode('container');
+      } else {
+        setFullscreenMode('none');
+      }
+    };
+
+    const vid = videoRef.current;
+    // iOS/iPadOS AVPlayer が webkitbeginfullscreen 時に即座に認識できるよう空のまま事前登録（非全画面時は0キュー・disabled）
+    if (vid && !radioMode && playerMode !== 'embed') {
+      ensureFullscreenTrack(vid);
+    }
+
+    syncFullscreenState();
+    const docEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'msfullscreenchange'];
+    docEvents.forEach((ev) => document.addEventListener(ev, syncFullscreenState));
+
+    const vidEvents = ['webkitbeginfullscreen', 'webkitendfullscreen', 'webkitpresentationmodechanged'];
+    if (vid) {
+      vidEvents.forEach((ev) => vid.addEventListener(ev, syncFullscreenState));
+    }
+
+    return () => {
+      docEvents.forEach((ev) => document.removeEventListener(ev, syncFullscreenState));
+      if (vid) {
+        vidEvents.forEach((ev) => vid.removeEventListener(ev, syncFullscreenState));
+      }
+    };
+  }, [currentView, playerMode, radioMode, currentVideo?.id]);
+
+  // 画面フルスクリーン時のみ <video> の TextTrack へ弾幕コメントを挿入し、通常再生に戻ったら即時削除する
+  useEffect(() => {
+    const clearTrackCues = (track: TextTrack | null) => {
+      if (!track) return;
+      try {
+        if (track.cues) {
+          for (let i = track.cues.length - 1; i >= 0; i--) {
+            track.removeCue(track.cues[i]);
+          }
+        }
+        track.mode = 'disabled';
+      } catch {}
+    };
+
+    const vid = videoRef.current;
+    const shouldInsertFullscreenTrack =
+      fullscreenMode === 'native-video' &&
+      !radioMode &&
+      playerMode !== 'embed' &&
+      Boolean(currentVideo) &&
+      Boolean(vid) &&
+      (nicoCommentsOn || (subtitleEnabled && activeSubtitleCues.length > 0));
+
+    if (!shouldInsertFullscreenTrack || !vid) {
+      clearTrackCues(fullscreenCommentTrackRef.current);
+      injectedLiveFullscreenIdsRef.current.clear();
+      return;
+    }
+
+    if (typeof window === 'undefined' || typeof window.VTTCue !== 'function') {
+      return;
+    }
+
+    const track = ensureFullscreenTrack(vid);
+    if (!track) return;
+
+    const existingTracks = Array.from(vid.textTracks || []);
+    for (const t of existingTracks) {
+      if (t !== track) {
+        try {
+          t.mode = 'disabled';
+        } catch {}
+      }
+    }
+
+    const isAppleNativeAv =
+      Boolean((vid as any).webkitDisplayingFullscreen) ||
+      (vid as any).webkitPresentationMode === 'fullscreen' ||
+      (/iPhone|iPad|iPod/i.test(navigator.userAgent) && document.fullscreenElement !== vid);
+
+    const danmakuCueRefs: TextTrackCue[] = [];
+
+    const configureDanmakuCueBox = (cue: VTTCue, lanePercent: number) => {
+      try {
+        cue.snapToLines = false;
+        cue.line = lanePercent;
+        if (isAppleNativeAv) {
+          // iOS/iPadOS AVPlayer で幅が狭まり縦1文字ずつ折り返されるバグを防ぐため幅94%中央配置にする
+          cue.size = 94;
+          cue.align = 'center';
+          cue.position = 50;
+        } else {
+          // デスクトップは幅45%を保ったまま右半面から左端へ流す
+          cue.size = 45;
+          cue.align = 'start';
+          cue.position = 55;
+        }
+      } catch {}
+    };
+
+    if (currentVideo?.isLive) {
+      if (!nicoCommentsOn) {
+        clearTrackCues(track);
+        injectedLiveFullscreenIdsRef.current.clear();
+        return;
+      }
+
+      const nowSec = Number.isFinite(vid.currentTime) ? Math.max(0, vid.currentTime) : 0;
+      try {
+        if (track.cues) {
+          for (let i = track.cues.length - 1; i >= 0; i--) {
+            const c = track.cues[i];
+            if (c.endTime < nowSec - 8) {
+              track.removeCue(c);
+            }
+          }
+        }
+      } catch {}
+
+      const liveLanes = [10, 22, 34, 46, 58];
+      const nonSystem = liveComments.filter((c) => c?.id && !c.isSystem && c.text?.trim());
+      const isInitialBurst = injectedLiveFullscreenIdsRef.current.size === 0;
+      const candidates = isInitialBurst ? nonSystem.slice(-5) : nonSystem.slice(-8);
+
+      candidates.forEach((c, idx) => {
+        if (injectedLiveFullscreenIdsRef.current.has(c.id)) return;
+        injectedLiveFullscreenIdsRef.current.add(c.id);
+        const startSec = nowSec + (isInitialBurst ? idx * 0.45 : idx * 0.25);
+        const endSec = startSec + 2.8;
+        const lanePct = liveLanes[idx % liveLanes.length];
+        const normalized = c.text.replace(/\s+/g, ' ').trim();
+        const clipped = normalized.length > 30 ? `${normalized.slice(0, 29)}…` : normalized;
+        try {
+          const cue = new window.VTTCue(startSec, endSec, clipped);
+          configureDanmakuCueBox(cue, lanePct);
+          track.addCue(cue);
+        } catch {}
+      });
+
+      if (track.cues) {
+        for (let i = 0; i < track.cues.length; i++) {
+          danmakuCueRefs.push(track.cues[i]);
+        }
+      }
+    } else {
+      // VOD: ネイティブ全画面中のみレーン別弾幕コメントキュー（＋字幕ON時は下部字幕キュー）を挿入
+      clearTrackCues(track);
+      injectedLiveFullscreenIdsRef.current.clear();
+
+      if (nicoCommentsOn && danmakuPool.length > 0) {
+        const danmakuCues = buildFullscreenDanmakuCues(danmakuPool, {
+          videoDurationMs:
+            Number.isFinite(vid.duration) && vid.duration > 0
+              ? Math.round(vid.duration * 1000)
+              : undefined
+        });
+        for (const c of danmakuCues) {
+          const s = Math.max(0, c.startMs / 1000);
+          const e = Math.max(s + 1.0, c.endMs / 1000);
+          try {
+            const cue = new window.VTTCue(s, e, c.text);
+            configureDanmakuCueBox(cue, c.linePercent);
+            track.addCue(cue);
+            danmakuCueRefs.push(cue);
+          } catch {}
+        }
+      }
+
+      if (subtitleEnabled && activeSubtitleCues.length > 0) {
+        for (const sub of activeSubtitleCues) {
+          const s = Math.max(0, (sub.startMs - subtitleOffsetMs) / 1000);
+          const e = Math.max(s + 0.5, (sub.endMs - subtitleOffsetMs) / 1000);
+          try {
+            const cue = new window.VTTCue(s, e, sub.text);
+            try {
+              cue.snapToLines = false;
+              cue.line = 88;
+              cue.size = 94;
+              cue.align = 'center';
+              cue.position = 50;
+            } catch {}
+            track.addCue(cue);
+          } catch {}
+        }
+      }
+    }
+
+    try {
+      track.mode = 'hidden';
+      requestAnimationFrame(() => {
+        if (fullscreenCommentTrackRef.current === track && fullscreenModeRef.current === 'native-video') {
+          try {
+            track.mode = 'showing';
+          } catch {}
+        }
+      });
+      track.mode = 'showing';
+    } catch {}
+
+    // デスクトップ等の native <video> フルスクリーンでは VTTCue.position を右→左へ滑らかに移動させて弾幕感を再現
+    if (isAppleNativeAv || danmakuCueRefs.length === 0) {
+      return;
+    }
+
+    const animTimer = window.setInterval(() => {
+      if (fullscreenModeRef.current !== 'native-video') return;
+      const cur = vid.currentTime;
+      for (const rawCue of danmakuCueRefs) {
+        const cue = rawCue as VTTCue;
+        if (cur >= cue.startTime && cur <= cue.endTime) {
+          const dur = Math.max(0.5, cue.endTime - cue.startTime);
+          const progress = Math.min(1, Math.max(0, (cur - cue.startTime) / dur));
+          const nextPos = Math.round((55 - progress * 53) * 10) / 10;
+          try {
+            cue.position = nextPos;
+          } catch {}
+        }
+      }
+    }, 85);
+
+    return () => {
+      window.clearInterval(animTimer);
+    };
+  }, [
+    fullscreenMode,
+    radioMode,
+    playerMode,
+    currentVideo?.id,
+    currentVideo?.isLive,
+    nicoCommentsOn,
+    danmakuPool,
+    liveComments,
+    subtitleEnabled,
+    activeSubtitleCues,
+    subtitleOffsetMs
+  ]);
 
   useEffect(() => {
     const onQuota = (ev: Event) => {
@@ -645,14 +1127,10 @@ export default function App() {
       const directStreamUrl = getStreamUrl(currentVideo);
       if (!mediaEl.src.endsWith(directStreamUrl)) {
         mediaEl.src = directStreamUrl;
+        mediaEl.load();
       }
-      if (autoPlayRef.current) {
-        const playPromise = mediaEl.play();
-        if (playPromise !== undefined) {
-          playPromise
-            .then(() => setIsVideoPlaying(true))
-            .catch(() => setIsVideoPlaying(false));
-        }
+      if (autoPlayRef.current && !userPausedRef.current) {
+        void attemptAutoPlay(mediaEl);
       } else {
         mediaEl.pause();
         setIsVideoPlaying(false);
@@ -728,34 +1206,13 @@ export default function App() {
         setVideoLoadingStage('自動再生OFF（再生ボタンを押して視聴）');
         return;
       }
-      el.play()
-        .then(() => {
-          if (cancelled) return;
-          setIsVideoPlaying(true);
+      void attemptAutoPlay(el).then((started) => {
+        if (cancelled) return;
+        if (!started && el.readyState >= 2) {
           setIsVideoLoading(false);
-          setVideoLoadingPercent(100);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          if (!radioMode) {
-            el.muted = true;
-            el.play()
-              .then(() => {
-                if (cancelled) return;
-                setIsVideoPlaying(true);
-                setIsVideoLoading(false);
-                setVideoLoadingPercent(100);
-              })
-              .catch(() => {
-                if (cancelled) return;
-                setIsVideoLoading(false);
-                setIsVideoPlaying(false);
-              });
-          } else {
-            setIsVideoLoading(false);
-            setIsVideoPlaying(false);
-          }
-        });
+          setIsVideoPlaying(false);
+        }
+      });
     };
 
     const viewerId = getLiveViewerId();
@@ -889,9 +1346,11 @@ export default function App() {
             });
           } else if (mediaEl.canPlayType('application/vnd.apple.mpegurl')) {
             mediaEl.src = resolvedStreamUrl;
+            mediaEl.load();
             trySafePlay(mediaEl);
           } else {
             mediaEl.src = resolvedStreamUrl;
+            mediaEl.load();
             trySafePlay(mediaEl);
           }
         } else {
@@ -1252,6 +1711,9 @@ export default function App() {
   const playVideo = (v: Video, modeOverride?: 'freemake' | 'embed' | 'custom', qualityOverride?: string) => {
     videoRetryCountRef.current = 0;
     loadedStreamKeyRef.current = '';
+    userPausedRef.current = false;
+    setIsAutoMutedFallback(false);
+    setNextAutoPlayState(null);
     const targetMode: 'freemake' | 'embed' | 'custom' = modeOverride || 'freemake';
     if (qualityOverride) {
       setFreemakeQuality(qualityOverride);
@@ -1292,6 +1754,9 @@ export default function App() {
     // Start with user-posted local danmaku only until authentic nvcomment loads
     setVodCommentFilter('');
     setCustomSubtitles(null);
+    setFetchedSubtitles(null);
+    setFetchedSubtitleLabel('');
+    setSubtitleOffsetMs(0);
     setActiveSubtitleText('');
     if (v.isLive) {
       setDanmakuPool([]);
@@ -1338,7 +1803,8 @@ export default function App() {
               size: c.size || 'medium',
               postedAt: c.postedAt,
               score: c.score,
-              nicoruCount: Number(c.nicoruCount || 0)
+              nicoruCount: Number(c.nicoruCount || 0),
+              fork: c.fork || 'main'
             }));
             setDanmakuPool([...apiComments, ...getVideoDanmaku(v.id)]);
           }
@@ -1372,6 +1838,26 @@ export default function App() {
           }
         })
         .catch(() => {});
+    } else if (!v.isLive && v.url && /^https?:\/\//i.test(v.url)) {
+      // 外部動画URL（YouTube等）の場合は公式字幕/自動字幕を自動取得
+      const subUrl = `/api/subtitles?url=${encodeURIComponent(v.url)}`;
+      fetch(subUrl)
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error('HTTP'))))
+        .catch(() => apiCall(subUrl).then((r) => r.json()))
+        .then((data) => {
+          if (data?.ok && data?.vtt) {
+            const cues = parseSubtitleFileText(String(data.vtt));
+            if (cues.length > 0) {
+              setFetchedSubtitles(cues);
+              setFetchedSubtitleLabel(
+                data.source === 'official'
+                  ? `公式字幕 (${data.lang || 'ja'})`
+                  : `自動字幕 (${data.lang || 'ja'})`
+              );
+            }
+          }
+        })
+        .catch(() => {});
     }
 
     danmakuTimerRef.current.clear();
@@ -1382,12 +1868,18 @@ export default function App() {
     switchView('player');
   };
 
-  // Continuous Danmaku comment flow when watching VOD in lightweight HTML5 or embed mode
+  // Continuous Danmaku comment flow when watching VOD (normal & container fullscreen)
   useEffect(() => {
-    if (currentView !== 'player' || !nicoCommentsOn || currentVideo?.isLive || danmakuPool.length === 0) return;
+    if (
+      currentView !== 'player' ||
+      !nicoCommentsOn ||
+      currentVideo?.isLive ||
+      danmakuPool.length === 0
+    ) {
+      return;
+    }
 
     let idx = 0;
-    // Initial burst of comments so comments flow immediately across the video
     const count = Math.min(5, danmakuPool.length);
     for (let i = 0; i < count; i++) {
       setTimeout(() => {
@@ -1410,7 +1902,7 @@ export default function App() {
 
     const timer = setInterval(() => {
       if (!nicoCommentsOn || danmakuPool.length === 0) return;
-      if (playerMode === 'custom') {
+      if (playerMode !== 'embed') {
         const el = getActiveMediaEl();
         if (el && el.paused) return;
       }
@@ -1531,12 +2023,9 @@ export default function App() {
         el.pause();
         return;
       }
-      el.play().catch(() => {
-        if (!radioMode) {
-          el.muted = true;
-          el.play().catch(() => {});
-        }
-      });
+      if (!userPausedRef.current) {
+        void attemptAutoPlay(el);
+      }
     }
   }, [playerMode, currentVideo?.id]);
 
@@ -1569,18 +2058,59 @@ export default function App() {
     }
 
     const conv = convertSearchQuery(raw, searchConvertEnabled && !skipConversion);
-    const effectiveQuery = conv.converted || raw;
-    setSearchConversion(conv);
+    let effectiveQuery = conv.converted || raw;
+    let finalConv: SearchConversionResult = conv;
+
+    setIsSearchFocused(false);
+    setActiveConvertIdx(-1);
+
+    if (conv.needsRemoteIme && page === 1 && !skipConversion) {
+      setIsSearchingOnline(true);
+      const hiraForApi = conv.hiraText || toSearchHiragana(raw);
+      const cacheKey = `${raw}::${hiraForApi}`;
+      let remoteEntry = convertCacheRef.current.get(cacheKey);
+      if (!remoteEntry) {
+        try {
+          const fetchedEntry = await fetchSearchConvertWithFallback(raw, hiraForApi, AbortSignal.timeout(900));
+          if (fetchedEntry.candidates.length > 0 || fetchedEntry.primary) {
+            remoteEntry = fetchedEntry;
+            if (convertCacheRef.current.size > 150) convertCacheRef.current.clear();
+            convertCacheRef.current.set(cacheKey, remoteEntry);
+          }
+        } catch {
+          // fallback to local conversion
+        }
+      }
+      if (remoteEntry) {
+        const remoteTexts = remoteEntry.candidates.map((c) => c.text);
+        if (remoteEntry.primary && remoteEntry.primary !== raw) {
+          effectiveQuery = remoteEntry.primary;
+          finalConv = {
+            ...conv,
+            converted: remoteEntry.primary,
+            wasConverted: remoteEntry.primary !== raw,
+            reason: 'IME漢字・予測変換',
+            alternatives: Array.from(new Set([conv.converted, ...remoteTexts, ...conv.alternatives]))
+              .filter((s) => s && s !== remoteEntry!.primary && s !== raw)
+              .slice(0, 10)
+          };
+        } else if (remoteTexts.length > 0) {
+          finalConv = {
+            ...conv,
+            alternatives: Array.from(new Set([...remoteTexts, ...conv.alternatives]))
+              .filter((s) => s && s !== effectiveQuery && s !== raw)
+              .slice(0, 10)
+          };
+        }
+      }
+    }
+
+    setSearchConversion(finalConv);
     setSearchQuery(effectiveQuery);
     if (overrideSort) {
       setSearchSort(overrideSort);
     }
     setSearchApiPage(page);
-
-    // Save to search history
-    addSearchHistory(effectiveQuery);
-    setSearchHistory(getSearchHistory());
-    setIsSearchFocused(false);
 
     const q = effectiveQuery.toLowerCase();
 
@@ -1679,12 +2209,20 @@ export default function App() {
     }
 
     if (!activeEl) return;
+
+    // iOS/iPadOS Safari で webkitDisplayingFullscreen が変化している場合の同期フォールバック
+    const isAppleFs = Boolean((activeEl as any).webkitDisplayingFullscreen) || (activeEl as any).webkitPresentationMode === 'fullscreen';
+    if (isAppleFs && fullscreenModeRef.current !== 'native-video') {
+      setFullscreenMode('native-video');
+    } else if (!isAppleFs && fullscreenModeRef.current === 'native-video' && !document.fullscreenElement && !(document as any).webkitFullscreenElement) {
+      setFullscreenMode('none');
+    }
+
     const timeMs = activeEl.currentTime * 1000;
 
-    // 字幕オーバーレイを現在再生時間へ同期
+    // 字幕オーバーレイを現在再生時間へ高精度二分探索で同期
     if (subtitleEnabled && !radioMode && activeSubtitleCues.length > 0) {
-      const hit = activeSubtitleCues.find((c) => timeMs >= c.startMs && timeMs <= c.endMs);
-      const nextSub = hit ? hit.text : '';
+      const nextSub = findActiveSubtitleText(activeSubtitleCues, timeMs, subtitleOffsetMs);
       setActiveSubtitleText((prev) => (prev === nextSub ? prev : nextSub));
     } else if (activeSubtitleText) {
       setActiveSubtitleText('');
@@ -2105,10 +2643,49 @@ export default function App() {
   };
 
   const handleRequestFullscreen = () => {
+    const fsEl =
+      document.fullscreenElement ||
+      (document as any).webkitFullscreenElement ||
+      (document as any).mozFullScreenElement;
+    const vid = videoRef.current as any;
+
+    if (fsEl) {
+      if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      } else if ((document as any).webkitExitFullscreen) {
+        (document as any).webkitExitFullscreen();
+      }
+      return;
+    }
+
+    if (vid?.webkitDisplayingFullscreen && typeof vid.webkitExitFullscreen === 'function') {
+      try {
+        vid.webkitExitFullscreen();
+      } catch {}
+      return;
+    }
+
     const el = videoContainerRef.current as any;
-    if (el) {
-      if (el.requestFullscreen) el.requestFullscreen();
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    const canContainerFs = Boolean(document.fullscreenEnabled || (document as any).webkitFullscreenEnabled);
+    if (el && canContainerFs) {
+      if (el.requestFullscreen) {
+        Promise.resolve(el.requestFullscreen()).catch(() => {
+          if (vid && typeof vid.webkitEnterFullscreen === 'function') {
+            try { vid.webkitEnterFullscreen(); } catch {}
+          }
+        });
+        return;
+      }
+      if (el.webkitRequestFullscreen) {
+        try {
+          el.webkitRequestFullscreen();
+          return;
+        } catch {}
+      }
+    }
+
+    if (vid && typeof vid.webkitEnterFullscreen === 'function') {
+      try { vid.webkitEnterFullscreen(); } catch {}
     }
   };
 
@@ -2153,6 +2730,38 @@ export default function App() {
   const relatedVideos = liveRelatedVideos.length > 0
     ? liveRelatedVideos.filter((v) => v.id !== currentVideo?.id)
     : videos.filter((v) => v.id !== currentVideo?.id).slice(0, 10);
+
+  const handleMediaEnded = () => {
+    danmakuTimerRef.current.clear();
+    setIsVideoPlaying(false);
+    if (!autoPlayRef.current || playerLoop || !currentVideo || currentVideo.isLive) {
+      return;
+    }
+    const pool = [
+      ...relatedVideos,
+      ...rankingVideos.filter((v) => v.id !== currentVideo.id),
+      ...videos.filter((v) => v.id !== currentVideo.id)
+    ];
+    const nextVideo = pool.find((v) => v && v.id !== currentVideo.id && !v.isLive);
+    if (nextVideo) {
+      setNextAutoPlayState({ nextVideo, secondsLeft: radioMode ? 1 : 3 });
+    }
+  };
+
+  useEffect(() => {
+    if (!nextAutoPlayState) return;
+    if (nextAutoPlayState.secondsLeft <= 0) {
+      const target = nextAutoPlayState.nextVideo;
+      setNextAutoPlayState(null);
+      playVideo(target, playerMode === 'custom' ? 'custom' : 'freemake');
+      return;
+    }
+    const t = window.setTimeout(() => {
+      setNextAutoPlayState((prev) => (prev ? { ...prev, secondsLeft: prev.secondsLeft - 1 } : null));
+    }, 1000);
+    return () => window.clearTimeout(t);
+  }, [nextAutoPlayState]);
+
   const avgReview = reviews.length ? (reviews.reduce((a, b) => a + b.rating, 0) / reviews.length).toFixed(1) : '4.9';
 
   return (
@@ -2544,17 +3153,65 @@ export default function App() {
               <input
                 type="text"
                 id="searchInput"
-                placeholder="動画名・sm番号・URL"
+                placeholder="動画名・ローマ字/ひらがな変換・sm番号・URL"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setIsSearchFocused(true);
+                }}
                 onFocus={() => {
-                  setSearchHistory(getSearchHistory());
                   setIsSearchFocused(true);
                 }}
                 onBlur={() => {
-                  setTimeout(() => setIsSearchFocused(false), 260);
+                  setTimeout(() => setIsSearchFocused(false), 220);
+                }}
+                onKeyDown={(e) => {
+                  if (!isSearchFocused || searchDropdownCandidates.length === 0) return;
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setActiveConvertIdx((prev) => (prev + 1) % searchDropdownCandidates.length);
+                  } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setActiveConvertIdx((prev) => (prev <= 0 ? searchDropdownCandidates.length - 1 : prev - 1));
+                  } else if (e.key === 'Tab' && !e.shiftKey) {
+                    e.preventDefault();
+                    const idx = activeConvertIdx >= 0 ? activeConvertIdx : 0;
+                    const chosen = searchDropdownCandidates[idx];
+                    if (chosen) {
+                      setSearchQuery(chosen.text);
+                      setActiveConvertIdx(-1);
+                    }
+                  } else if (e.key === 'Enter' && activeConvertIdx >= 0) {
+                    const chosen = searchDropdownCandidates[activeConvertIdx];
+                    if (chosen) {
+                      e.preventDefault();
+                      void handleSearch(chosen.text, 1, undefined, true);
+                    }
+                  } else if (e.key === 'Escape') {
+                    setIsSearchFocused(false);
+                    setActiveConvertIdx(-1);
+                  }
                 }}
               />
+              {searchConvertEnabled && searchDropdownCandidates.length > 0 && (
+                <button
+                  type="button"
+                  className="zero-search-kanji-btn"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    const idx = activeConvertIdx >= 0 ? activeConvertIdx : 0;
+                    const chosen = searchDropdownCandidates[idx];
+                    if (chosen) {
+                      setSearchQuery(chosen.text);
+                      setIsSearchFocused(true);
+                      setActiveConvertIdx(idx);
+                    }
+                  }}
+                  title="漢字・最適表記へ変換して入力欄に反映"
+                >
+                  漢字変換
+                </button>
+              )}
               {searchQuery && (
                 <button
                   type="button"
@@ -2562,6 +3219,8 @@ export default function App() {
                   onClick={() => {
                     setSearchQuery('');
                     setSearchPage(0);
+                    setRemoteConvertCandidates([]);
+                    setActiveConvertIdx(-1);
                   }}
                   title="クリア"
                   aria-label="検索文字をクリア"
@@ -2570,86 +3229,53 @@ export default function App() {
                 </button>
               )}
 
-              {/* Search Conversion Preview & History Popover */}
-              {isSearchFocused && (() => {
-                const liveConv = searchConvertEnabled && searchQuery.trim().length > 0
-                  ? convertSearchQuery(searchQuery, true)
-                  : null;
-                const showConv = Boolean(liveConv?.wasConverted);
-                const showHist = searchHistory.length > 0;
-                if (!showConv && !showHist) return null;
-                return (
-                  <div className="search-popover-stack" onMouseDown={(e) => e.preventDefault()}>
-                    {showConv && liveConv && (
-                      <button
-                        type="button"
-                        className="search-convert-preview"
-                        onClick={() => void handleSearch(liveConv.converted, 1)}
-                        title="変換後のキーワードで検索"
+              {/* Live Search Conversion Popover (no search history) */}
+              {isSearchFocused && searchConvertEnabled && searchQuery.trim().length > 0 && (searchDropdownCandidates.length > 0 || isFetchingConvert) && (
+                <div className="search-popover-stack" onMouseDown={(e) => e.preventDefault()}>
+                  <div className="search-convert-dropdown" role="listbox" aria-label="検索変換候補">
+                    <div className="search-convert-header">
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+                        <span className="material-icons" style={{ fontSize: '14px', color: 'var(--accent-strong)' }}>auto_fix_high</span>
+                        <span>変換・検索候補 ({searchDropdownCandidates.length}件)</span>
+                        {isFetchingConvert && <span className="search-convert-loading">漢字変換中...</span>}
+                      </span>
+                      <span style={{ fontSize: '10.5px', opacity: 0.75 }}>↑↓選択 / Tab入力</span>
+                    </div>
+                    {searchDropdownCandidates.map((cand, idx) => (
+                      <div
+                        key={`${cand.kind}:${cand.text}`}
+                        role="option"
+                        aria-selected={idx === activeConvertIdx}
+                        className={`search-convert-item ${idx === activeConvertIdx ? 'active' : ''}`}
+                        onMouseEnter={() => setActiveConvertIdx(idx)}
+                        onClick={() => void handleSearch(cand.text, 1, undefined, true)}
                       >
-                        <span className="material-icons" style={{ fontSize: '14px' }}>auto_fix_high</span>
-                        <span>変換候補: {liveConv.converted}</span>
-                      </button>
-                    )}
-                    {showHist && (
-                      <div id="search-history-dropdown">
-                        <div className="history-dropdown-header">
-                          <span>検索履歴 ({searchHistory.length}件)</span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              clearSearchHistory();
-                              setSearchHistory([]);
-                            }}
-                            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '11px' }}
-                          >
-                            履歴を全削除
-                          </button>
-                        </div>
-                        {searchHistory.map((item) => (
-                          <div
-                            key={item}
-                            className="history-dropdown-item"
-                            onClick={() => {
-                              setSearchQuery(item);
-                              setIsSearchFocused(false);
-                              handleSearch(item);
-                            }}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              style={{ width: '15px', height: '15px', flexShrink: 0, opacity: 0.65 }}
-                            >
-                              <circle cx="12" cy="12" r="10" />
-                              <polyline points="12 6 12 12 16 14" />
-                            </svg>
-                            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {item}
-                            </span>
-                            <button
-                              type="button"
-                              className="history-delete-btn"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                removeSearchHistory(item);
-                                setSearchHistory(getSearchHistory());
-                              }}
-                              title="履歴から削除"
-                            >
-                              削除
-                            </button>
-                          </div>
-                        ))}
+                        <span className={`search-convert-badge ${cand.kind}`}>{cand.badge}</span>
+                        <span className="search-convert-text">{cand.text}</span>
+                        <button
+                          type="button"
+                          className="search-convert-insert-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSearchQuery(cand.text);
+                            setActiveConvertIdx(-1);
+                          }}
+                          title="検索欄に入力"
+                        >
+                          入力
+                        </button>
                       </div>
-                    )}
+                    ))}
+                    <button
+                      type="button"
+                      className="search-convert-raw-btn"
+                      onClick={() => void handleSearch(searchQuery.trim(), 1, undefined, true)}
+                    >
+                      「{searchQuery.trim()}」のまま検索
+                    </button>
                   </div>
-                );
-              })()}
+                </div>
+              )}
             </div>
           </form>
 
@@ -4911,33 +5537,102 @@ export default function App() {
                               playsInline
                               preload="auto"
                               loop={playerLoop}
-                              onPlay={() => {
+                              onPlay={(e) => {
+                                userPausedRef.current = false;
+                                setNextAutoPlayState(null);
                                 setIsVideoPlaying(true);
                                 setIsVideoLoading(false);
+                                setIsAutoMutedFallback(e.currentTarget.muted);
                               }}
-                              onPause={() => setIsVideoPlaying(false)}
+                              onPause={(e) => {
+                                if (!e.currentTarget.ended && !isVideoLoading) {
+                                  userPausedRef.current = true;
+                                }
+                                setIsVideoPlaying(false);
+                              }}
                               onLoadedMetadata={(e) => {
-                                if (!autoPlayRef.current) e.currentTarget.pause();
+                                if (!autoPlayRef.current) {
+                                  e.currentTarget.pause();
+                                } else if (!userPausedRef.current && e.currentTarget.paused) {
+                                  void attemptAutoPlay(e.currentTarget);
+                                }
                                 setIsVideoLoading(false);
                                 setVideoLoadingPercent(100);
                               }}
-                              onCanPlay={() => {
+                              onLoadedData={(e) => {
+                                if (autoPlayRef.current && !userPausedRef.current && e.currentTarget.paused && !e.currentTarget.ended) {
+                                  void attemptAutoPlay(e.currentTarget);
+                                }
+                              }}
+                              onCanPlay={(e) => {
                                 setVideoLoadingPercent(100);
                                 setVideoLoadingStage('音声再生準備完了！');
                                 setIsVideoLoading(false);
+                                if (autoPlayRef.current && !userPausedRef.current && e.currentTarget.paused && !e.currentTarget.ended) {
+                                  void attemptAutoPlay(e.currentTarget);
+                                }
                               }}
-                              onPlaying={() => {
+                              onPlaying={(e) => {
+                                userPausedRef.current = false;
                                 setVideoLoadingPercent(100);
                                 setIsVideoLoading(false);
                                 setIsVideoPlaying(true);
                                 setVideoError(null);
+                                setIsAutoMutedFallback(e.currentTarget.muted);
+                              }}
+                              onVolumeChange={(e) => {
+                                if (!e.currentTarget.muted) setIsAutoMutedFallback(false);
                               }}
                               onError={() => {
                                 setIsVideoLoading(false);
                               }}
                               onTimeUpdate={handleTimeUpdate}
-                              onEnded={() => setIsVideoPlaying(false)}
+                              onEnded={handleMediaEnded}
                             />
+
+                            {nextAutoPlayState && (
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  gap: '10px',
+                                  width: 'min(560px, 100%)',
+                                  padding: '8px 12px',
+                                  borderRadius: '8px',
+                                  background: 'rgba(2, 132, 199, 0.22)',
+                                  border: '1px solid rgba(56, 189, 248, 0.45)',
+                                  color: '#ffffff',
+                                  fontSize: '12px'
+                                }}
+                              >
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  次の動画を自動再生 ({nextAutoPlayState.secondsLeft}秒): {nextAutoPlayState.nextVideo.title}
+                                </span>
+                                <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+                                  <button
+                                    type="button"
+                                    className="zero-primary-btn"
+                                    style={{ padding: '4px 10px', fontSize: '11px' }}
+                                    onClick={() => {
+                                      const target = nextAutoPlayState.nextVideo;
+                                      setNextAutoPlayState(null);
+                                      playVideo(target, playerMode === 'custom' ? 'custom' : 'freemake');
+                                    }}
+                                  >
+                                    今すぐ再生
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="zero-secondary-btn"
+                                    style={{ padding: '4px 10px', fontSize: '11px' }}
+                                    onClick={() => setNextAutoPlayState(null)}
+                                  >
+                                    キャンセル
+                                  </button>
+                                </div>
+                              </div>
+                            )}
 
                             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', width: 'min(560px, 100%)' }}>
                               <p className="radio-mode-hint">
@@ -4963,26 +5658,51 @@ export default function App() {
                             playsInline
                             preload="auto"
                             loop={playerLoop}
-                            onPlay={() => {
+                            onPlay={(e) => {
+                              userPausedRef.current = false;
+                              setNextAutoPlayState(null);
                               setIsVideoPlaying(true);
                               setIsVideoLoading(false);
+                              setIsAutoMutedFallback(e.currentTarget.muted);
                             }}
-                            onPause={() => setIsVideoPlaying(false)}
+                            onPause={(e) => {
+                              if (!e.currentTarget.ended && !isVideoLoading) {
+                                userPausedRef.current = true;
+                              }
+                              setIsVideoPlaying(false);
+                            }}
                             onLoadedMetadata={(e) => {
-                              if (!autoPlayRef.current) e.currentTarget.pause();
+                              if (!autoPlayRef.current) {
+                                e.currentTarget.pause();
+                              } else if (!userPausedRef.current && e.currentTarget.paused) {
+                                void attemptAutoPlay(e.currentTarget);
+                              }
                               setIsVideoLoading(false);
                               setVideoLoadingPercent(100);
                             }}
-                            onCanPlay={() => {
+                            onLoadedData={(e) => {
+                              if (autoPlayRef.current && !userPausedRef.current && e.currentTarget.paused && !e.currentTarget.ended) {
+                                void attemptAutoPlay(e.currentTarget);
+                              }
+                            }}
+                            onCanPlay={(e) => {
                               setVideoLoadingPercent(100);
                               setVideoLoadingStage('動画準備完了！');
                               setIsVideoLoading(false);
+                              if (autoPlayRef.current && !userPausedRef.current && e.currentTarget.paused && !e.currentTarget.ended) {
+                                void attemptAutoPlay(e.currentTarget);
+                              }
                             }}
-                            onPlaying={() => {
+                            onPlaying={(e) => {
+                              userPausedRef.current = false;
                               setVideoLoadingPercent(100);
                               setIsVideoLoading(false);
                               setIsVideoPlaying(true);
                               setVideoError(null);
+                              setIsAutoMutedFallback(e.currentTarget.muted);
+                            }}
+                            onVolumeChange={(e) => {
+                              if (!e.currentTarget.muted) setIsAutoMutedFallback(false);
                             }}
                             onError={(e) => {
                               console.warn('HTML5 Video player error:', e);
@@ -4990,47 +5710,157 @@ export default function App() {
                             }}
                             onTimeUpdate={handleTimeUpdate}
                             onSeeked={() => danmakuTimerRef.current.clear()}
-                            onEnded={() => {
-                              danmakuTimerRef.current.clear();
-                              setIsVideoPlaying(false);
-                            }}
+                            onEnded={handleMediaEnded}
                             style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
                           >
-                            {subtitleEnabled && subtitleVttUrl && (
-                              <track kind="subtitles" srcLang="ja" label="日本語字幕" src={subtitleVttUrl} default />
+                            {subtitleEnabled && subtitleVttUrl && fullscreenMode !== 'native-video' && (
+                              <track kind="subtitles" srcLang="ja" label="日本語字幕" src={subtitleVttUrl} />
                             )}
                           </video>
                         )}
 
-                        {/* Big Centered Play Button when media is paused & ready */}
-                        {!isVideoPlaying && !isVideoLoading && !videoError && !radioMode && (
-                          <div
+                        {/* One-tap unmute button when browser blocked unmuted autoplay */}
+                        {isVideoPlaying && isAutoMutedFallback && !radioMode && (
+                          <button
+                            type="button"
                             onClick={(e) => {
                               e.stopPropagation();
                               const el = getActiveMediaEl();
                               if (el) {
                                 el.muted = false;
+                                if (el.volume === 0) el.volume = 1;
+                                setIsAutoMutedFallback(false);
+                              }
+                            }}
+                            style={{
+                              position: 'absolute',
+                              top: '12px',
+                              left: '12px',
+                              zIndex: 22,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                              padding: '7px 12px',
+                              borderRadius: '20px',
+                              border: '1px solid rgba(255,255,255,0.3)',
+                              background: 'rgba(0, 0, 0, 0.78)',
+                              color: '#ffffff',
+                              fontSize: '12px',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              boxShadow: '0 4px 14px rgba(0,0,0,0.45)'
+                            }}
+                          >
+                            <span className="material-icons" style={{ fontSize: '16px', color: '#38bdf8' }}>volume_off</span>
+                            <span>消音で自動再生中（タップで音声ON）</span>
+                          </button>
+                        )}
+
+                        {/* Next Video Continuous Auto-Play Countdown Overlay */}
+                        {nextAutoPlayState && !radioMode && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              position: 'absolute',
+                              inset: 0,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: '12px',
+                              background: 'rgba(0, 0, 0, 0.82)',
+                              backdropFilter: 'blur(6px)',
+                              zIndex: 24,
+                              padding: '20px',
+                              color: '#ffffff',
+                              textAlign: 'center'
+                            }}
+                          >
+                            <div style={{ fontSize: '12px', fontWeight: 700, color: '#38bdf8' }}>
+                              次の動画を自動再生します（あと {nextAutoPlayState.secondsLeft} 秒）
+                            </div>
+                            <div style={{ fontSize: '15px', fontWeight: 700, maxWidth: '420px', lineHeight: 1.4 }}>
+                              {nextAutoPlayState.nextVideo.title}
+                            </div>
+                            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const target = nextAutoPlayState.nextVideo;
+                                  setNextAutoPlayState(null);
+                                  playVideo(target, playerMode === 'custom' ? 'custom' : 'freemake');
+                                }}
+                                style={{
+                                  padding: '8px 18px',
+                                  borderRadius: '8px',
+                                  border: 0,
+                                  background: '#0284c7',
+                                  color: '#ffffff',
+                                  fontSize: '13px',
+                                  fontWeight: 700,
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                今すぐ再生
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setNextAutoPlayState(null)}
+                                style={{
+                                  padding: '8px 18px',
+                                  borderRadius: '8px',
+                                  border: '1px solid rgba(255,255,255,0.28)',
+                                  background: 'rgba(255,255,255,0.12)',
+                                  color: '#ffffff',
+                                  fontSize: '13px',
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                キャンセル
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Big Centered Play Button when media is paused & ready */}
+                        {!isVideoPlaying && !isVideoLoading && !videoError && !radioMode && !nextAutoPlayState && (
+                          <div
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              userPausedRef.current = false;
+                              const el = getActiveMediaEl();
+                              if (el) {
+                                el.muted = false;
                                 el.play().then(() => {
                                   setIsVideoPlaying(true);
+                                  setIsAutoMutedFallback(false);
                                 }).catch(() => {
                                   if (el && !radioMode) {
                                     el.muted = true;
-                                    el.play().then(() => setIsVideoPlaying(true)).catch(() => {});
+                                    el.play().then(() => {
+                                      setIsVideoPlaying(true);
+                                      setIsAutoMutedFallback(true);
+                                    }).catch(() => {});
                                   }
                                 });
                               }
                             }}
                             onTouchEnd={(e) => {
                               e.stopPropagation();
+                              userPausedRef.current = false;
                               const el = getActiveMediaEl();
                               if (el) {
                                 el.muted = false;
                                 el.play().then(() => {
                                   setIsVideoPlaying(true);
+                                  setIsAutoMutedFallback(false);
                                 }).catch(() => {
                                   if (el && !radioMode) {
                                     el.muted = true;
-                                    el.play().then(() => setIsVideoPlaying(true)).catch(() => {});
+                                    el.play().then(() => {
+                                      setIsVideoPlaying(true);
+                                      setIsAutoMutedFallback(true);
+                                    }).catch(() => {});
                                   }
                                 });
                               }
@@ -5256,7 +6086,7 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Danmaku layer */}
+                        {/* Danmaku layer (normal & container fullscreen) */}
                         {nicoCommentsOn && !radioMode && (
                           <div id="nico-comment-layer" className="nico-comment-layer">
                             {activeDanmaku.map((d) => (
@@ -5278,8 +6108,38 @@ export default function App() {
                           </div>
                         )}
 
-                        {/* Subtle Gear Settings Button (Top-Right) */}
-                        <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 20 }}>
+                        {/* Fullscreen (Danmaku) & Gear Settings Buttons (Top-Right) */}
+                        <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 20, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          {!radioMode && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRequestFullscreen();
+                              }}
+                              style={{
+                                background: 'rgba(0,0,0,0.55)',
+                                backdropFilter: 'blur(4px)',
+                                border: '1px solid rgba(255,255,255,0.18)',
+                                color: '#ffffff',
+                                borderRadius: '50%',
+                                width: '32px',
+                                height: '32px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                cursor: 'pointer',
+                                padding: 0,
+                                boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+                                transition: 'all 0.2s ease'
+                              }}
+                              title={fullscreenMode !== 'none' ? '全画面解除' : '全画面表示（弾幕コメント付き）'}
+                            >
+                              <span className="material-icons" style={{ fontSize: '18px' }}>
+                                {fullscreenMode !== 'none' ? 'fullscreen_exit' : 'fullscreen'}
+                              </span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={(e) => {
@@ -5366,7 +6226,54 @@ export default function App() {
                               className="overlay-btn"
                               onClick={() => subtitleFileInputRef.current?.click()}
                             >
-                              字幕読込 (.vtt/.srt)
+                              字幕読込 (.vtt/.srt/.ass)
+                            </button>
+                            {subtitleEnabled && activeSubtitleCues.length > 0 && (
+                              <div style={{ padding: '4px 0', borderTop: '1px solid rgba(255,255,255,0.12)', marginTop: '4px' }}>
+                                <div style={{ fontSize: '10.5px', color: '#94a3b8', marginBottom: '4px' }}>
+                                  {activeSubtitleSourceLabel} ({activeSubtitleCues.length}行)
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                  <button
+                                    type="button"
+                                    className="overlay-btn"
+                                    style={{ flex: 1, padding: '4px 6px', fontSize: '11px' }}
+                                    onClick={() => setSubtitleOffsetMs((p) => Math.max(-5000, p - 500))}
+                                  >
+                                    -0.5秒
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="overlay-btn"
+                                    style={{ flex: 1, padding: '4px 6px', fontSize: '11px' }}
+                                    onClick={() => setSubtitleOffsetMs(0)}
+                                    title="タイミングリセット"
+                                  >
+                                    {subtitleOffsetMs === 0 ? '同期0s' : `${subtitleOffsetMs > 0 ? '+' : ''}${(subtitleOffsetMs / 1000).toFixed(1)}s`}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="overlay-btn"
+                                    style={{ flex: 1, padding: '4px 6px', fontSize: '11px' }}
+                                    onClick={() => setSubtitleOffsetMs((p) => Math.min(5000, p + 500))}
+                                  >
+                                    +0.5秒
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                            <button
+                              type="button"
+                              className="overlay-btn"
+                              onClick={() => {
+                                const next = !autoPlayEnabled;
+                                const updated = { ...settings, autoPlay: next };
+                                setSettings(updated);
+                                saveSettings(updated);
+                                showPlayerNotification(next ? '自動再生をONにしました' : '自動再生をOFFにしました');
+                              }}
+                            >
+                              自動再生: {autoPlayEnabled ? 'ON' : 'OFF'}
                             </button>
                             <button
                               type="button"
@@ -5400,7 +6307,7 @@ export default function App() {
                               PiP
                             </button>
                             <button className="overlay-btn" onClick={handleRequestFullscreen}>
-                              全画面表示
+                              {fullscreenMode !== 'none' ? '全画面解除' : '全画面表示'}
                             </button>
                           </div>
                         )}
@@ -5490,7 +6397,7 @@ export default function App() {
                         <input
                           ref={subtitleFileInputRef}
                           type="file"
-                          accept=".vtt,.srt,text/vtt,application/x-subrip"
+                          accept=".vtt,.srt,.ass,.ssa,text/vtt,application/x-subrip"
                           style={{ display: 'none' }}
                           onChange={(e) => {
                             const file = e.target.files?.[0];

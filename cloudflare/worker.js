@@ -270,6 +270,96 @@ export default {
       );
     }
 
+    // 5.5 漢字・検索変換（Google日本語IME＋ニコニコ公式サジェストをWorkerエッジで直接処理）
+    if (path === '/api/search/convert') {
+      const raw = String(url.searchParams.get('q') || '').trim().slice(0, 120);
+      const hiraQuery = String(url.searchParams.get('hira') || raw).trim().slice(0, 120);
+      if (!raw && !hiraQuery) {
+        return jsonResponse({ ok: true, raw: '', hira: '', primary: '', candidates: [] });
+      }
+
+      const hiraClauses = hiraQuery.split(/\s+/).filter(Boolean).join(',');
+      const hasKana = /[\u3041-\u309f\u30a1-\u30ff]/.test(hiraQuery);
+
+      const fetchIme = async () => {
+        if (!hasKana || !hiraClauses) return [];
+        try {
+          const resp = await fetch(
+            `https://www.google.com/transliterate?langpair=ja-Hira|ja&text=${encodeURIComponent(hiraClauses)}`
+          );
+          if (!resp.ok) return [];
+          const data = await resp.json();
+          if (!Array.isArray(data) || data.length === 0) return [];
+          if (data.length === 1 && Array.isArray(data[0]?.[1])) {
+            return data[0][1].map((s) => String(s)).filter(Boolean).slice(0, 8);
+          }
+          const hadSpace = /\s/.test(hiraQuery);
+          const sep = hadSpace ? ' ' : '';
+          const segChoices = data.map((seg) =>
+            Array.isArray(seg?.[1]) && seg[1].length > 0
+              ? seg[1].map((s) => String(s)).filter(Boolean)
+              : [String(seg?.[0] || '')]
+          );
+          const out = [];
+          for (let k = 0; k < 4; k++) {
+            const joined = segChoices.map((c) => c[k] || c[0] || '').join(sep).trim();
+            if (joined) out.push(joined);
+          }
+          for (let sIdx = 0; sIdx < segChoices.length; sIdx++) {
+            for (let altIdx = 1; altIdx < Math.min(4, segChoices[sIdx].length); altIdx++) {
+              const varied = segChoices.map((c, i) => (i === sIdx ? c[altIdx] : c[0] || '')).join(sep).trim();
+              if (varied) out.push(varied);
+            }
+          }
+          return Array.from(new Set(out)).filter(Boolean).slice(0, 10);
+        } catch {
+          return [];
+        }
+      };
+
+      const fetchNicoSuggest = async (term) => {
+        if (!term) return [];
+        try {
+          const resp = await fetch(`https://sug.search.nicovideo.jp/suggestion/complete/${encodeURIComponent(term)}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+          });
+          if (!resp.ok) return [];
+          const json = await resp.json();
+          return Array.isArray(json?.candidates) ? json.candidates.map((c) => String(c)).filter(Boolean).slice(0, 12) : [];
+        } catch {
+          return [];
+        }
+      };
+
+      const [imeList, nicoFromHira, nicoFromRaw] = await Promise.all([
+        fetchIme(),
+        fetchNicoSuggest(hiraQuery || raw),
+        raw && raw !== hiraQuery ? fetchNicoSuggest(raw) : Promise.resolve([]),
+      ]);
+      const extraTargets = Array.from(new Set([imeList[0], imeList[1]].filter((t) => Boolean(t && t !== hiraQuery && t !== raw))));
+      const nicoFromImeLists = extraTargets.length > 0 ? await Promise.all(extraTargets.map((t) => fetchNicoSuggest(t))) : [];
+
+      const seen = new Set();
+      const candidates = [];
+      const pushCand = (text, kind) => {
+        const clean = String(text || '').trim();
+        if (!clean || seen.has(clean)) return;
+        seen.add(clean);
+        candidates.push({ text: clean, kind });
+      };
+      imeList.slice(0, 8).forEach((t) => pushCand(t, 'ime'));
+      nicoFromImeLists.forEach((arr) => arr.forEach((t) => pushCand(t, 'nico')));
+      nicoFromHira.forEach((t) => pushCand(t, 'nico'));
+      nicoFromRaw.forEach((t) => pushCand(t, 'nico'));
+
+      const primary = imeList[0] || nicoFromHira[0] || nicoFromRaw[0] || hiraQuery || raw;
+      return jsonResponse(
+        { ok: true, raw, hira: hiraQuery, primary, candidates: candidates.slice(0, 25) },
+        200,
+        { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
+      );
+    }
+
     // 6. 一般API全転送（3台Render分散＆自動フェイルオーバー）
     if (path.startsWith('/api/')) {
       const seed = `${path}:${url.searchParams.get('q') || url.searchParams.get('url') || Date.now()}`;

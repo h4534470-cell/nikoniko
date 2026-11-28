@@ -48,47 +48,8 @@ const KEYS = {
   COMMENTS_STORE: 'zero_comments_by_video',
   DANMAKU_STORE: 'zero_danmaku_by_video',
   LIKED_COMMENTS: 'zero_liked_comments',
-  LIKED_VIDEOS: 'zero_liked_videos',
-  SEARCH_HISTORY: 'zero_search_history'
+  LIKED_VIDEOS: 'zero_liked_videos'
 };
-
-export function getSearchHistory(): string[] {
-  try {
-    const raw = safeStorage.getItem(KEYS.SEARCH_HISTORY);
-    return raw ? JSON.parse(raw) : ['ラーメン', '初音ミク', '東方', 'チルノ', '作業用BGM', '陰陽師', '料理'];
-  } catch {
-    return ['ラーメン', '初音ミク', '東方', 'チルノ'];
-  }
-}
-
-export function addSearchHistory(query: string): string[] {
-  try {
-    const clean = query.trim();
-    if (!clean) return getSearchHistory();
-    const existing = getSearchHistory().filter((item) => item !== clean);
-    const updated = [clean, ...existing].slice(0, 20);
-    safeStorage.setItem(KEYS.SEARCH_HISTORY, JSON.stringify(updated));
-    return updated;
-  } catch {
-    return [query];
-  }
-}
-
-export function removeSearchHistory(term: string): string[] {
-  try {
-    const existing = getSearchHistory().filter((item) => item !== term);
-    safeStorage.setItem(KEYS.SEARCH_HISTORY, JSON.stringify(existing));
-    return existing;
-  } catch {
-    return [];
-  }
-}
-
-export function clearSearchHistory(): void {
-  try {
-    safeStorage.setItem(KEYS.SEARCH_HISTORY, JSON.stringify([]));
-  } catch {}
-}
 
 export function getDeviceId(): string {
   try {

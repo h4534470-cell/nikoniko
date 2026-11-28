@@ -184,7 +184,7 @@ body.niconico-theme .zero-menu-btn:hover {
 .zero-search-input-wrap input {
   width: 100%;
   height: 32px;
-  padding: 0 28px 0 10px;
+  padding: 0 90px 0 10px;
   background: #ffffff;
   color: #111111;
   border: 1.5px solid #222222;
@@ -202,6 +202,33 @@ body.niconico-theme .zero-search-input-wrap input {
 .zero-search-input-wrap input:focus {
   border-color: #0284c7;
   box-shadow: 0 0 0 2px rgba(82, 190, 245, 0.35);
+}
+
+.zero-search-kanji-btn {
+  position: absolute;
+  right: 29px;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid rgba(2, 132, 199, 0.45);
+  border-radius: 4px;
+  background: rgba(2, 132, 199, 0.12);
+  color: #0369a1;
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+body.niconico-theme .zero-search-kanji-btn {
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+.zero-search-kanji-btn:hover {
+  background: rgba(2, 132, 199, 0.22);
 }
 
 .zero-search-clear {
@@ -1167,7 +1194,29 @@ video {
 }
 
 #video-container-inner:fullscreen video, #video-container-inner:-webkit-full-screen video {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
   object-fit: contain;
+}
+
+#video-container-inner:fullscreen .nico-comment-layer,
+#video-container-inner:-webkit-full-screen .nico-comment-layer {
+  z-index: 15;
+  inset: 0;
+}
+
+#video-container-inner:fullscreen .nico-flow-comment,
+#video-container-inner:-webkit-full-screen .nico-flow-comment {
+  font-size: clamp(24px, 2.8vw, 42px);
+}
+
+#video-container-inner:fullscreen .video-subtitle-overlay,
+#video-container-inner:-webkit-full-screen .video-subtitle-overlay {
+  z-index: 16;
+  bottom: 68px;
+  font-size: clamp(16px, 2.1vw, 26px);
 }
 
 /* Modals */
@@ -1397,7 +1446,7 @@ video {
   text-overflow: ellipsis;
 }
 
-/* Search History Box */
+/* Live Search Conversion Dropdown */
 .search-popover-stack {
   position: absolute;
   top: calc(100% + 4px);
@@ -1409,60 +1458,127 @@ video {
   z-index: 105;
 }
 
-#search-history-dropdown {
+.search-convert-dropdown {
   position: relative;
   width: 100%;
   background: var(--bg-page);
   border: 1px solid var(--border-color);
   border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
-  max-height: 360px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  max-height: 440px;
   overflow-y: auto;
   color: var(--text-main);
 }
 
-.history-dropdown-header {
+.search-convert-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  padding: 7px 12px;
   font-size: 11px;
   color: var(--text-muted);
   font-weight: 600;
   border-bottom: 1px solid var(--border-color);
+  background: var(--bg-surface-alt);
 }
 
-.history-dropdown-item {
+.search-convert-loading {
+  font-size: 10.5px;
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.search-convert-item {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
+  gap: 9px;
+  padding: 8px 12px;
   border: 0;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.08);
   background: transparent;
   color: var(--text-main);
   font-size: 13px;
   cursor: pointer;
   text-align: left;
+  transition: background-color 0.12s ease;
 }
 
-.history-dropdown-item:hover {
-  background: var(--bg-surface-alt);
+.search-convert-item:hover,
+.search-convert-item.active {
+  background: var(--accent-soft);
 }
 
-.history-delete-btn {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--text-muted);
-  padding: 4px 8px;
+.search-convert-badge {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
   border-radius: 4px;
-  background: transparent;
-  border: none;
+  line-height: 1.3;
+}
+
+.search-convert-badge.dict {
+  background: rgba(2, 132, 199, 0.15);
+  color: var(--accent-strong);
+}
+
+.search-convert-badge.ime {
+  background: rgba(16, 185, 129, 0.15);
+  color: #059669;
+}
+
+.search-convert-badge.nico {
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+}
+
+.search-convert-badge.kana {
+  background: rgba(107, 114, 128, 0.15);
+  color: var(--text-muted);
+}
+
+.search-convert-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.search-convert-insert-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-surface-alt);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
   cursor: pointer;
 }
 
-.history-delete-btn:hover {
-  color: #dc2626;
+.search-convert-insert-btn:hover {
+  color: var(--accent-strong);
+  border-color: var(--accent);
+}
+
+.search-convert-raw-btn {
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-surface-alt);
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.search-convert-raw-btn:hover {
+  color: var(--text-main);
+  background: var(--bg-surface);
 }
 
 .settings-section {
@@ -2359,44 +2475,28 @@ body.niconico-theme .quota-fallback-banner {
 .video-subtitle-overlay {
   position: absolute;
   left: 50%;
-  bottom: 44px;
+  bottom: 52px;
   transform: translateX(-50%);
-  max-width: min(88%, 680px);
-  padding: 6px 14px;
+  max-width: min(88%, 740px);
+  padding: 7px 16px;
   border-radius: 8px;
-  background: rgba(0, 0, 0, 0.74);
+  background: rgba(8, 10, 15, 0.84);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   color: #ffffff;
-  font-size: clamp(14px, 1.8vw, 20px);
+  font-size: clamp(14px, 1.85vw, 21px);
   font-weight: 700;
-  line-height: 1.45;
+  line-height: 1.5;
+  letter-spacing: 0.015em;
   text-align: center;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.9);
   pointer-events: none;
   z-index: 12;
-  white-space: pre-wrap;
+  white-space: pre-line;
   word-break: break-word;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
 }
 
-/* Live Search Conversion Preview Chip & Banner */
-.search-convert-preview {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 7px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(2, 132, 199, 0.45);
-  background: var(--bg-page);
-  color: var(--accent-strong);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: left;
-}
+/* Live Search Conversion Banner */
 
 .search-conversion-banner {
   display: flex;
