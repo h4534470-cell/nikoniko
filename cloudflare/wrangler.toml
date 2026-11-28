@@ -1,0 +1,11 @@
+name = "niconico-2"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+RENDER_ORIGINS = "https://nikoniko-4.onrender.com,https://nikoniko-dass.onrender.com,https://nikoniko-ju6x.onrender.com"
+# Vercelも予備として混ぜたい場合は以下にURLを設定
+VERCEL_ORIGIN = ""
+
+[triggers]
+crons = ["*/10 * * * *"]

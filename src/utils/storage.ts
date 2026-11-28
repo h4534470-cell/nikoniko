@@ -334,17 +334,33 @@ export function getMyReview(): Review | undefined {
 }
 
 export function getSettings(): AppSettings {
-  try {
-    const raw = safeStorage.getItem(KEYS.SETTINGS);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return {
+  const defaults: AppSettings = {
     apiRouteMethod: 'auto',
-    thumbMethod: 'direct',
+    thumbMethod: 'server',
     nicoPlayMethod: 'proxy',
+    autoPlay: true,
+    subtitleEnabled: true,
+    searchConvertEnabled: true,
+    vercelApiUrl: '',
     danmakuSpeed: 8,
     danmakuFontSize: 24
   };
+  try {
+    const raw = safeStorage.getItem(KEYS.SETTINGS);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        ...defaults,
+        ...parsed,
+        thumbMethod: parsed.thumbMethod === 'direct' ? 'direct' : 'server',
+        autoPlay: parsed.autoPlay !== false,
+        subtitleEnabled: parsed.subtitleEnabled !== false,
+        searchConvertEnabled: parsed.searchConvertEnabled !== false,
+        vercelApiUrl: typeof parsed.vercelApiUrl === 'string' ? parsed.vercelApiUrl : ''
+      };
+    }
+  } catch {}
+  return defaults;
 }
 
 export function saveSettings(settings: AppSettings): void {

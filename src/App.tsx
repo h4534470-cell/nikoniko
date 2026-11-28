@@ -3,7 +3,10 @@ import Hls from 'hls.js';
 import { Video, ViewType, Review, ChannelSubscription, Playlist, NicoComment, LiveProgram, LiveChatComment, AppSettings } from './types';
 import { INITIAL_VIDEOS, INITIAL_REVIEWS } from './data/mockVideos';
 import { downloadNiconicoInBrowser } from './utils/nicoDownload';
-import { buildApiUrl } from './utils/apiRoute';
+import { buildApiUrl, apiFetch, getAutoNodeDisplayInfo, rerollAutoNode, getLiveViewerId, getConfiguredVercelUrl, RENDER_SERVER_URLS, QUOTA_EXCEEDED_EVENT, QUOTA_EXCEEDED_MESSAGE, LIVE_CAPACITY_FULL_MESSAGE } from './utils/apiRoute';
+import { ThumbImg, resolveThumbnailDataUrl } from './components/ThumbImg';
+import { convertSearchQuery, SearchConversionResult } from './utils/searchQuery';
+import { SubtitleCue, parseSubtitleFileText, buildAutoSubtitlesFromComments, createVttBlobUrl } from './utils/subtitles';
 import {
   safeStorage,
   getPlayHistory,
@@ -282,15 +285,17 @@ export default function App() {
         activeEl.src = streamUrl;
         activeEl.load();
       }
-      setTimeout(() => {
-        const el = getActiveMediaEl();
-        if (el) {
-          el.play().catch(() => {
-            el.muted = true;
-            el.play().catch(() => {});
-          });
-        }
-      }, 50);
+      if (autoPlayRef.current) {
+        setTimeout(() => {
+          const el = getActiveMediaEl();
+          if (el) {
+            el.play().catch(() => {
+              el.muted = true;
+              el.play().catch(() => {});
+            });
+          }
+        }, 50);
+      }
     }
   };
 
@@ -358,18 +363,68 @@ export default function App() {
   const [reviewStatus, setReviewStatus] = useState<string>('');
   const [myReview, setMyReview] = useState<Review | undefined>(undefined);
 
-  // Settings
+  // Settings & Distributed Route State
   const [settings, setSettings] = useState(() => getSettings());
+  const autoPlayRef = useRef<boolean>(settings.autoPlay !== false);
+  useEffect(() => {
+    autoPlayRef.current = settings.autoPlay !== false;
+  }, [settings.autoPlay]);
+  const [customSubtitles, setCustomSubtitles] = useState<SubtitleCue[] | null>(null);
+  const [activeSubtitleText, setActiveSubtitleText] = useState<string>('');
+  const [searchConversion, setSearchConversion] = useState<SearchConversionResult | null>(null);
+  const [vercelUrlDraft, setVercelUrlDraft] = useState<string>(() => getSettings().vercelApiUrl || '');
+  const subtitleFileInputRef = useRef<HTMLInputElement>(null);
+  const [autoNodeInfo, setAutoNodeInfo] = useState(() => getAutoNodeDisplayInfo());
+  const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
   const apiUrl = (path: string) => buildApiUrl(path, settings.apiRouteMethod);
+  const apiCall = (path: string, init?: RequestInit) => apiFetch(path, init, settings.apiRouteMethod);
   const [apiRouteStatus, setApiRouteStatus] = useState<string>(() => {
     const initial = getSettings().apiRouteMethod;
     if (initial === 'worker') return 'Cloudflare Worker (niconico-2.na8526130.workers.dev) を使用中';
-    if (initial === 'render') return 'Render (nikoniko-4.onrender.com) を使用中';
-    return 'メインサーバー を使用中';
+    if (initial === 'render') return 'Render #1 (nikoniko-4.onrender.com) を使用中';
+    if (initial === 'render2') return 'Render #2 (nikoniko-dass.onrender.com) を使用中';
+    if (initial === 'render3') return 'Render #3 (nikoniko-ju6x.onrender.com) を使用中';
+    if (initial === 'vercel') return `Vercel API (${getConfiguredVercelUrl() || '同一オリジン'}) を使用中`;
+    if (initial === 'direct') return 'メインサーバー直通を使用中';
+    return `自動選択（分散）: ${getAutoNodeDisplayInfo().label}`;
   });
   const [apiBenchmarks, setApiBenchmarks] = useState<Record<string, { loading: boolean; ms: number | null; ok: boolean | null }>>({});
   const [isMeasuringApis, setIsMeasuringApis] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<string>(() => safeStorage.getItem('zeroThemeMode') || 'light');
+
+  const subtitleEnabled = settings.subtitleEnabled !== false;
+  const autoPlayEnabled = settings.autoPlay !== false;
+  const searchConvertEnabled = settings.searchConvertEnabled !== false;
+
+  const activeSubtitleCues = useMemo<SubtitleCue[]>(() => {
+    if (customSubtitles && customSubtitles.length > 0) return customSubtitles;
+    if (!currentVideo || currentVideo.isLive) return [];
+    return buildAutoSubtitlesFromComments(danmakuPool);
+  }, [customSubtitles, currentVideo?.id, currentVideo?.isLive, danmakuPool]);
+
+  const [subtitleVttUrl, setSubtitleVttUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!subtitleEnabled || activeSubtitleCues.length === 0) {
+      setSubtitleVttUrl(null);
+      return;
+    }
+    const url = createVttBlobUrl(activeSubtitleCues);
+    setSubtitleVttUrl(url);
+    return () => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+    };
+  }, [subtitleEnabled, activeSubtitleCues]);
+
+  useEffect(() => {
+    const onQuota = (ev: Event) => {
+      const msg = (ev as CustomEvent)?.detail?.message || QUOTA_EXCEEDED_MESSAGE;
+      setQuotaBanner(String(msg));
+    };
+    window.addEventListener(QUOTA_EXCEEDED_EVENT, onQuota);
+    return () => window.removeEventListener(QUOTA_EXCEEDED_EVENT, onQuota);
+  }, []);
 
   // Download modal & Freemake-style URL Downloader state
   const [isDownloadDialogOpen, setIsDownloadDialogOpen] = useState<boolean>(false);
@@ -450,21 +505,45 @@ export default function App() {
     return videoRef.current;
   };
 
-  // Sync Media Session metadata and lock-screen/background playback controls
+  // Sync Media Session metadata, artwork, position state & lock-screen/background controls
   useEffect(() => {
     if (!('mediaSession' in navigator) || !currentVideo) return;
+    let active = true;
+    const applyMetadata = (artSrc: string) => {
+      if (!active) return;
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: currentVideo.title || 'ZERO-ニコ動',
+          artist: currentVideo.channel || 'ニコニコ動画',
+          album: currentVideo.isLive
+            ? 'ニコニコ生放送'
+            : radioMode
+              ? 'ZERO-ニコ動 ラジオモード'
+              : (currentVideo.category || 'ZERO-ニコ動'),
+          artwork: artSrc
+            ? [
+                { src: artSrc, sizes: '320x180', type: 'image/jpeg' },
+                { src: artSrc, sizes: '640x360', type: 'image/jpeg' }
+              ]
+            : []
+        });
+      } catch {}
+    };
+
+    if (currentVideo.thumbnail) {
+      applyMetadata(currentVideo.thumbnail);
+      if (settings.thumbMethod === 'server') {
+        void resolveThumbnailDataUrl(currentVideo.thumbnail, 'server', settings.apiRouteMethod).then((dataUrl) => {
+          if (dataUrl && dataUrl !== currentVideo.thumbnail) {
+            applyMetadata(dataUrl);
+          }
+        });
+      }
+    } else {
+      applyMetadata('');
+    }
+
     try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: currentVideo.title || 'ZERO-ニコ動',
-        artist: currentVideo.channel || 'ニコニコ動画',
-        album: radioMode ? 'ZERO-ニコ動 ラジオモード' : 'ZERO-ニコ動',
-        artwork: currentVideo.thumbnail
-          ? [
-              { src: currentVideo.thumbnail, sizes: '320x180', type: 'image/jpeg' },
-              { src: currentVideo.thumbnail, sizes: '640x360', type: 'image/jpeg' }
-            ]
-          : []
-      });
       navigator.mediaSession.playbackState = isVideoPlaying ? 'playing' : 'paused';
       navigator.mediaSession.setActionHandler('play', () => {
         const el = getActiveMediaEl();
@@ -476,14 +555,44 @@ export default function App() {
       });
       navigator.mediaSession.setActionHandler('seekbackward', (details) => {
         const el = getActiveMediaEl();
-        if (el) el.currentTime = Math.max(0, el.currentTime - (details.seekOffset || 10));
+        if (el && !currentVideo.isLive) {
+          el.currentTime = Math.max(0, el.currentTime - (details.seekOffset || 10));
+        }
       });
       navigator.mediaSession.setActionHandler('seekforward', (details) => {
         const el = getActiveMediaEl();
-        if (el) el.currentTime = Math.min(el.duration || el.currentTime + 10, el.currentTime + (details.seekOffset || 10));
+        if (el && !currentVideo.isLive) {
+          el.currentTime = Math.min(el.duration || el.currentTime + 10, el.currentTime + (details.seekOffset || 10));
+        }
+      });
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        const el = getActiveMediaEl();
+        if (el && !currentVideo.isLive && typeof details.seekTime === 'number') {
+          if (details.fastSeek && 'fastSeek' in el && typeof (el as HTMLVideoElement).fastSeek === 'function') {
+            (el as HTMLVideoElement).fastSeek(details.seekTime);
+          } else {
+            el.currentTime = Math.max(0, details.seekTime);
+          }
+        }
+      });
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        if (playHistory.length > 1) {
+          const prev = playHistory.find((v) => v.id !== currentVideo.id);
+          if (prev) playVideo(prev);
+        }
+      });
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        const list = liveRelatedVideos.length > 0 ? liveRelatedVideos : videos;
+        const idx = list.findIndex((v) => v.id === currentVideo.id);
+        const next = idx >= 0 && idx + 1 < list.length ? list[idx + 1] : list.find((v) => v.id !== currentVideo.id);
+        if (next) playVideo(next);
       });
     } catch {}
-  }, [currentVideo?.id, currentVideo?.title, currentVideo?.channel, currentVideo?.thumbnail, isVideoPlaying, radioMode, playerMode]);
+
+    return () => {
+      active = false;
+    };
+  }, [currentVideo?.id, currentVideo?.title, currentVideo?.channel, currentVideo?.thumbnail, currentVideo?.isLive, isVideoPlaying, radioMode, playerMode, settings.thumbMethod, settings.apiRouteMethod]);
 
   // Real-time stream attachment for Freemake (HLS / Range Proxy / ffmpeg) & Custom HTML5 player (supports Video & Radio Audio-Only)
   useEffect(() => {
@@ -537,11 +646,16 @@ export default function App() {
       if (!mediaEl.src.endsWith(directStreamUrl)) {
         mediaEl.src = directStreamUrl;
       }
-      const playPromise = mediaEl.play();
-      if (playPromise !== undefined) {
-        playPromise
-          .then(() => setIsVideoPlaying(true))
-          .catch(() => setIsVideoPlaying(false));
+      if (autoPlayRef.current) {
+        const playPromise = mediaEl.play();
+        if (playPromise !== undefined) {
+          playPromise
+            .then(() => setIsVideoPlaying(true))
+            .catch(() => setIsVideoPlaying(false));
+        }
+      } else {
+        mediaEl.pause();
+        setIsVideoPlaying(false);
       }
       return;
     }
@@ -605,6 +719,15 @@ export default function App() {
     };
 
     const trySafePlay = (el: HTMLMediaElement) => {
+      if (!autoPlayRef.current) {
+        if (cancelled) return;
+        el.pause();
+        setIsVideoPlaying(false);
+        setIsVideoLoading(false);
+        setVideoLoadingPercent(100);
+        setVideoLoadingStage('自動再生OFF（再生ボタンを押して視聴）');
+        return;
+      }
       el.play()
         .then(() => {
           if (cancelled) return;
@@ -635,10 +758,16 @@ export default function App() {
         });
     };
 
+    const viewerId = getLiveViewerId();
+    const isLiveBroadcast = Boolean(currentVideo.isLive);
+
     (async () => {
       try {
-        const resp = await fetch(
-          apiUrl(`/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}`)
+        const liveParams = isLiveBroadcast
+          ? `&liveQuality=low&vid=${encodeURIComponent(viewerId)}`
+          : '';
+        const resp = await apiCall(
+          `/api/freemake/stream-info?url=${encodeURIComponent(targetUrl)}&quality=${encodeURIComponent(freemakeQuality)}${radioMode ? '&audioOnly=1' : ''}${liveParams}`
         );
         const rawText = await resp.text();
         let data: any = null;
@@ -649,13 +778,25 @@ export default function App() {
         }
         if (cancelled) return;
 
+        if (resp.status === 429 || data?.code === 'QUOTA_EXCEEDED') {
+          setQuotaBanner(QUOTA_EXCEEDED_MESSAGE);
+          throw new Error(`QUOTA_EXCEEDED:${QUOTA_EXCEEDED_MESSAGE}`);
+        }
+        if (data?.code === 'LIVE_CAPACITY_FULL' || (resp.status === 503 && String(data?.error || '').includes('満員'))) {
+          throw new Error(`LIVE_CAPACITY_FULL:${data?.error || LIVE_CAPACITY_FULL_MESSAGE}`);
+        }
         if (!resp.ok || !data?.ok || !data?.streamUrl) {
           throw new Error(data?.error || `ストリーム取得に失敗しました (HTTP ${resp.status})`);
         }
 
-        const resolvedStreamUrl = String(data.streamUrl).startsWith('/')
-          ? apiUrl(String(data.streamUrl))
-          : String(data.streamUrl);
+        const rawStreamUrl = String(data.streamUrl);
+        const withViewer =
+          isLiveBroadcast && !rawStreamUrl.includes('vid=')
+            ? `${rawStreamUrl}${rawStreamUrl.includes('?') ? '&' : '?'}vid=${encodeURIComponent(viewerId)}`
+            : rawStreamUrl;
+        const resolvedStreamUrl = withViewer.startsWith('/')
+          ? apiUrl(withViewer)
+          : withViewer;
 
         setFreemakeStreamType(data.mode || 'proxy');
         setFreemakeResolvedUrl(resolvedStreamUrl);
@@ -670,22 +811,24 @@ export default function App() {
             if (!hasNativeMSE && 'ManagedMediaSource' in window && 'disableRemotePlayback' in mediaEl) {
               (mediaEl as HTMLVideoElement).disableRemotePlayback = true;
             }
-            const isLiveStream = Boolean(currentVideo.isLive);
             const hls = new Hls({
               enableWorker: hasNativeMSE,
-              lowLatencyMode: isLiveStream,
-              ...(isLiveStream
+              lowLatencyMode: false,
+              ...(isLiveBroadcast
                 ? {
-                    liveSyncDurationCount: 2,
-                    liveMaxLatencyDurationCount: 4,
+                    // マニフェスト更新頻度・バッファ・画質を抑えて1.5秒共有キャッシュと相性最適化
+                    liveSyncDurationCount: 3,
+                    liveMaxLatencyDurationCount: 6,
                     backBufferLength: 10,
-                    maxBufferLength: 15,
-                    manifestLoadingMaxRetry: 4,
-                    manifestLoadingRetryDelay: 800,
-                    levelLoadingMaxRetry: 4,
-                    levelLoadingRetryDelay: 800,
-                    fragLoadingMaxRetry: 6,
-                    fragLoadingRetryDelay: 600
+                    maxBufferLength: 16,
+                    startLevel: 0,
+                    capLevelToPlayerSize: true,
+                    manifestLoadingMaxRetry: 3,
+                    manifestLoadingRetryDelay: 1500,
+                    levelLoadingMaxRetry: 3,
+                    levelLoadingRetryDelay: 1500,
+                    fragLoadingMaxRetry: 4,
+                    fragLoadingRetryDelay: 1000
                   }
                 : {
                     maxBufferLength: 25
@@ -696,8 +839,13 @@ export default function App() {
             let mediaRetries = 0;
             hls.loadSource(resolvedStreamUrl);
             hls.attachMedia(mediaEl);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            hls.on(Hls.Events.MANIFEST_PARSED, (_ev, parsedData) => {
               if (cancelled) return;
+              if (isLiveBroadcast && Array.isArray(parsedData?.levels) && parsedData.levels.length > 1) {
+                // 生放送はデフォルト低画質レベルを上限に設定し通信量を削減
+                hls.autoLevelCapping = 0;
+                hls.currentLevel = 0;
+              }
               networkRetries = 0;
               setVideoLoadingPercent(100);
               setIsVideoLoading(false);
@@ -709,10 +857,13 @@ export default function App() {
             });
             hls.on(Hls.Events.ERROR, (_event, errData) => {
               if (!errData.fatal || cancelled) return;
+              if (errData.response?.code === 429) {
+                setQuotaBanner(QUOTA_EXCEEDED_MESSAGE);
+              }
               if (errData.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 3) {
                 networkRetries++;
                 const code = errData.response?.code;
-                if (isLiveStream && (code === 403 || code === 410 || networkRetries >= 2)) {
+                if (isLiveBroadcast && (code === 403 || code === 410 || networkRetries >= 2)) {
                   const sep = resolvedStreamUrl.includes('?') ? '&' : '?';
                   hls.loadSource(`${resolvedStreamUrl}${sep}refresh=1&_t=${Date.now()}`);
                 } else {
@@ -752,20 +903,31 @@ export default function App() {
         if (cancelled) return;
         clearStallTimer();
         setIsVideoLoading(false);
+        const msg = String(err?.message || '');
+        if (msg.startsWith('LIVE_CAPACITY_FULL:')) {
+          setVideoError(msg.replace('LIVE_CAPACITY_FULL:', '') || LIVE_CAPACITY_FULL_MESSAGE);
+          return;
+        }
+        if (msg.startsWith('QUOTA_EXCEEDED:')) {
+          setVideoError(QUOTA_EXCEEDED_MESSAGE);
+          return;
+        }
         if (isNicoTarget && currentVideo.isLive && !radioMode) {
           setPlayerMode('embed');
           showPlayerNotification('公式生放送プレイヤーへ切り替えました');
         } else {
-          setVideoError(err?.message || 'ストリームの取得に失敗しました');
+          setVideoError(msg || 'ストリームの取得に失敗しました');
         }
       }
     })();
 
     let liveHeartbeatTimer: number | null = null;
     const liveHeartbeatId = (currentVideo.nicoId || currentVideo.id || '').toLowerCase();
-    if (currentVideo.isLive && /^lv\d+$/.test(liveHeartbeatId)) {
+    if (isLiveBroadcast && /^lv\d+$/.test(liveHeartbeatId)) {
       liveHeartbeatTimer = window.setInterval(() => {
-        fetch(apiUrl(`/api/nico/live/heartbeat/${encodeURIComponent(liveHeartbeatId)}`), { method: 'POST' }).catch(() => {});
+        apiCall(`/api/nico/live/heartbeat/${encodeURIComponent(liveHeartbeatId)}?vid=${encodeURIComponent(viewerId)}`, {
+          method: 'POST'
+        }).catch(() => {});
       }, 25000);
     }
 
@@ -774,6 +936,12 @@ export default function App() {
       clearStallTimer();
       if (liveHeartbeatTimer !== null) {
         window.clearInterval(liveHeartbeatTimer);
+      }
+      if (isLiveBroadcast && /^lv\d+$/.test(liveHeartbeatId)) {
+        fetch(apiUrl(`/api/nico/live/stop/${encodeURIComponent(liveHeartbeatId)}?vid=${encodeURIComponent(viewerId)}`), {
+          method: 'POST',
+          keepalive: true
+        }).catch(() => {});
       }
     };
   }, [playerMode, currentVideo?.id, currentView, freemakeQuality, radioMode]);
@@ -789,16 +957,31 @@ export default function App() {
 
   const measureApiServers = async () => {
     setIsMeasuringApis(true);
+    const currentAuto = getAutoNodeDisplayInfo();
+    setAutoNodeInfo(currentAuto);
+    const autoHealthUrl = currentAuto.baseUrl
+      ? `${currentAuto.baseUrl}${currentAuto.baseUrl.includes('workers.dev') ? '/health' : '/api/health'}`
+      : '/api/health';
+    const vercelBase = getConfiguredVercelUrl();
+    const isHostedVercel = typeof window !== 'undefined' && window.location.hostname.endsWith('.vercel.app');
     const targets: Array<{ id: AppSettings['apiRouteMethod']; url: string }> = [
-      { id: 'auto', url: '/api/health' },
+      { id: 'auto', url: autoHealthUrl },
       { id: 'worker', url: 'https://niconico-2.na8526130.workers.dev/health' },
-      { id: 'render', url: 'https://nikoniko-4.onrender.com/api/health' },
+      { id: 'render', url: `${RENDER_SERVER_URLS[0]}/api/health` },
+      { id: 'render2', url: `${RENDER_SERVER_URLS[1]}/api/health` },
+      { id: 'render3', url: `${RENDER_SERVER_URLS[2]}/api/health` },
+      ...(vercelBase || isHostedVercel
+        ? [{ id: 'vercel' as const, url: `${vercelBase}/api/health` }]
+        : []),
       { id: 'direct', url: '/api/health' }
     ];
     setApiBenchmarks({
       auto: { loading: true, ms: null, ok: null },
       worker: { loading: true, ms: null, ok: null },
       render: { loading: true, ms: null, ok: null },
+      render2: { loading: true, ms: null, ok: null },
+      render3: { loading: true, ms: null, ok: null },
+      ...(vercelBase || isHostedVercel ? { vercel: { loading: true, ms: null, ok: null } } : {}),
       direct: { loading: true, ms: null, ok: null }
     });
     await Promise.all(
@@ -847,7 +1030,7 @@ export default function App() {
     }
     setIsLoadingRanking(true);
     try {
-      const res = await fetch(apiUrl(`/api/nico/ranking?genre=${encodeURIComponent(genre)}&term=${encodeURIComponent(activeTerm)}`));
+      const res = await apiCall(`/api/nico/ranking?genre=${encodeURIComponent(genre)}&term=${encodeURIComponent(activeTerm)}`);
       const data = await res.json();
       if (data.success && Array.isArray(data.items) && data.items.length > 0) {
         setRankingVideos(data.items);
@@ -871,7 +1054,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await fetch('/api/nico/live/check-favorites', {
+      const res = await apiCall('/api/nico/live/check-favorites', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ subscriptions: subsList })
@@ -921,7 +1104,7 @@ export default function App() {
       if (q) params.set('q', q);
       params.set('sort', sort);
       if (!q && tab && tab !== 'all') params.set('tab', tab);
-      const res = await fetch(apiUrl(`/api/nico/live/search?${params.toString()}`));
+      const res = await apiCall(`/api/nico/live/search?${params.toString()}`);
       const rawText = await res.text();
       let data: any = null;
       try {
@@ -982,7 +1165,7 @@ export default function App() {
     };
     playVideo(initialVideo, 'freemake');
     try {
-      const res = await fetch(apiUrl(`/api/nico/live/info/${encodeURIComponent(cleanId)}`));
+      const res = await apiCall(`/api/nico/live/info/${encodeURIComponent(cleanId)}`);
       const data = await res.json();
       if (data.success && data.program) {
         const prog = data.program;
@@ -1006,7 +1189,7 @@ export default function App() {
   const openNicopediaModal = async (word: string) => {
     setDicModal({ word, loading: true });
     try {
-      const res = await fetch(`/api/nico/dic/${encodeURIComponent(word)}`);
+      const res = await apiCall(`/api/nico/dic/${encodeURIComponent(word)}`);
       const data = await res.json();
       if (data.success) {
         setDicModal({ word, title: data.title, summary: data.summary, url: data.url, loading: false });
@@ -1031,7 +1214,7 @@ export default function App() {
 
     setChannelProfile({ videos: [], mylists: [], series: [], loading: true });
     try {
-      const res = await fetch(`/api/nico/user/${encodeURIComponent(userMatch)}`);
+      const res = await apiCall(`/api/nico/user/${encodeURIComponent(userMatch)}`);
       const data = await res.json();
       if (data.success && data.user) {
         setChannelProfile({
@@ -1108,6 +1291,8 @@ export default function App() {
 
     // Start with user-posted local danmaku only until authentic nvcomment loads
     setVodCommentFilter('');
+    setCustomSubtitles(null);
+    setActiveSubtitleText('');
     if (v.isLive) {
       setDanmakuPool([]);
       setVodCommentsLoading(false);
@@ -1120,7 +1305,7 @@ export default function App() {
 
     // 1. Fetch authentic watch/v3_guest metadata (tags, counts, real owner, description)
     if (/^(sm|so|nm)\d+$/i.test(targetNicoId)) {
-      fetch(apiUrl(`/api/nico/video/${encodeURIComponent(targetNicoId)}`))
+      apiCall(`/api/nico/video/${encodeURIComponent(targetNicoId)}`)
         .then((res) => res.json())
         .then((data) => {
           if (data.success && data.video) {
@@ -1139,7 +1324,7 @@ export default function App() {
         .catch(() => {});
 
       // 2. Fetch authentic nvcomment danmaku comments
-      fetch(apiUrl(`/api/nico/comments/${encodeURIComponent(targetNicoId)}`))
+      apiCall(`/api/nico/comments/${encodeURIComponent(targetNicoId)}`)
         .then((res) => res.json())
         .then((data) => {
           if (data.success && Array.isArray(data.comments)) {
@@ -1164,7 +1349,7 @@ export default function App() {
         });
 
       // 3. Fetch real nvapi related recommendations
-      fetch(apiUrl(`/api/nico/related/${encodeURIComponent(targetNicoId)}`))
+      apiCall(`/api/nico/related/${encodeURIComponent(targetNicoId)}`)
         .then((res) => res.json())
         .then((data) => {
           if (data.success && Array.isArray(data.items)) {
@@ -1174,7 +1359,7 @@ export default function App() {
         .catch(() => {});
 
       // 4. Fetch content tree (親作品・子作品)
-      fetch(apiUrl(`/api/nico/tree/${encodeURIComponent(targetNicoId)}`))
+      apiCall(`/api/nico/tree/${encodeURIComponent(targetNicoId)}`)
         .then((res) => res.json())
         .then((data) => {
           if (data.success) {
@@ -1262,8 +1447,7 @@ export default function App() {
     const pollComments = async () => {
       try {
         const cursor = liveCommentsCursorRef.current;
-        const url = apiUrl(`/api/nico/live/comments/${encodeURIComponent(liveId)}${cursor > 0 ? `?since=${cursor}` : ''}`);
-        const res = await fetch(url);
+        const res = await apiCall(`/api/nico/live/comments/${encodeURIComponent(liveId)}${cursor > 0 ? `?since=${cursor}` : ''}`);
         const data = await res.json();
         if (cancelled) return;
 
@@ -1343,6 +1527,10 @@ export default function App() {
   useEffect(() => {
     const el = getActiveMediaEl();
     if (playerMode === 'custom' && currentVideo && el) {
+      if (!autoPlayRef.current) {
+        el.pause();
+        return;
+      }
       el.play().catch(() => {
         if (!radioMode) {
           el.muted = true;
@@ -1358,21 +1546,19 @@ export default function App() {
   const handleSearch = async (
     overrideQuery?: string,
     page: number = 1,
-    overrideSort?: string
+    overrideSort?: string,
+    skipConversion: boolean = false
   ) => {
     const targetQ = typeof overrideQuery === 'string' ? overrideQuery : searchQuery;
     const raw = targetQ.trim();
     const sortParam = overrideSort || searchSort;
-    if (typeof overrideQuery === 'string') {
-      setSearchQuery(overrideQuery);
-    }
-    if (overrideSort) {
-      setSearchSort(overrideSort);
-    }
-    setSearchApiPage(page);
 
     // If empty query, show all
     if (!raw) {
+      if (typeof overrideQuery === 'string') setSearchQuery('');
+      if (overrideSort) setSearchSort(overrideSort);
+      setSearchApiPage(page);
+      setSearchConversion(null);
       setOnlineSearchResults(null);
       setOnlineSearchError(null);
       setSearchTotalCount(videos.length);
@@ -1382,12 +1568,21 @@ export default function App() {
       return;
     }
 
+    const conv = convertSearchQuery(raw, searchConvertEnabled && !skipConversion);
+    const effectiveQuery = conv.converted || raw;
+    setSearchConversion(conv);
+    setSearchQuery(effectiveQuery);
+    if (overrideSort) {
+      setSearchSort(overrideSort);
+    }
+    setSearchApiPage(page);
+
     // Save to search history
-    addSearchHistory(raw);
+    addSearchHistory(effectiveQuery);
     setSearchHistory(getSearchHistory());
     setIsSearchFocused(false);
 
-    const q = raw.toLowerCase();
+    const q = effectiveQuery.toLowerCase();
 
     // Check if query contains a specific sm ID (e.g. sm9, sm1097445, so30413239)
     const matchSm = q.match(/(sm|so|nm)\d+/);
@@ -1402,7 +1597,7 @@ export default function App() {
       // Try fetching video metadata via server endpoint
       try {
         setIsSearchingOnline(true);
-        const res = await fetch(`/api/nico/video/${smId}`);
+        const res = await apiCall(`/api/nico/video/${smId}`);
         const data = await res.json();
         if (data.success && data.video) {
           const newVideo: Video = data.video;
@@ -1427,7 +1622,7 @@ export default function App() {
       return;
     }
 
-    // If user pasted any external video URL (TikTok, X, Vimeo, etc.), open Freemake-style Downloader & inspect
+    // If user pasted any external video URL, open Downloader & inspect
     if (/^https?:\/\//i.test(raw) && page === 1) {
       setDlUrlInput(raw);
       switchView('downloader');
@@ -1439,8 +1634,7 @@ export default function App() {
     setIsSearchingOnline(true);
     setOnlineSearchError(null);
     try {
-      const endpoint = apiUrl(`/api/nico/search?q=${encodeURIComponent(raw)}&sort=${sortParam}&order=d&page=${page}`);
-      const resp = await fetch(endpoint);
+      const resp = await apiCall(`/api/nico/search?q=${encodeURIComponent(effectiveQuery)}&sort=${sortParam}&order=d&page=${page}`);
       const result = await resp.json();
       if (result.success && Array.isArray(result.items) && result.items.length > 0) {
         setOnlineSearchResults(result.items);
@@ -1473,10 +1667,30 @@ export default function App() {
       const cur = activeEl.currentTime;
       const dur = activeEl.duration;
       setVideoPlayPercent(Math.min(100, Math.round((cur / dur) * 100)));
+      if ('mediaSession' in navigator && typeof navigator.mediaSession.setPositionState === 'function' && Number.isFinite(dur)) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: dur,
+            playbackRate: activeEl.playbackRate || 1,
+            position: Math.min(dur, Math.max(0, cur))
+          });
+        } catch {}
+      }
     }
 
-    if (!activeEl || !nicoCommentsOn || radioMode) return;
+    if (!activeEl) return;
     const timeMs = activeEl.currentTime * 1000;
+
+    // 字幕オーバーレイを現在再生時間へ同期
+    if (subtitleEnabled && !radioMode && activeSubtitleCues.length > 0) {
+      const hit = activeSubtitleCues.find((c) => timeMs >= c.startMs && timeMs <= c.endMs);
+      const nextSub = hit ? hit.text : '';
+      setActiveSubtitleText((prev) => (prev === nextSub ? prev : nextSub));
+    } else if (activeSubtitleText) {
+      setActiveSubtitleText('');
+    }
+
+    if (!nicoCommentsOn || radioMode) return;
 
     danmakuPool.forEach((item) => {
       if (!danmakuTimerRef.current.has(item.id) && Math.abs(item.timeMs - timeMs) < 1600) {
@@ -2356,66 +2570,86 @@ export default function App() {
                 </button>
               )}
 
-              {/* Search History Dropdown */}
-              {isSearchFocused && searchHistory.length > 0 && (
-                <div
-                  id="search-history-dropdown"
-                  onMouseDown={(e) => e.preventDefault()}
-                >
-                  <div className="history-dropdown-header">
-                    <span>検索履歴 ({searchHistory.length}件)</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        clearSearchHistory();
-                        setSearchHistory([]);
-                      }}
-                      style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '11px' }}
-                    >
-                      履歴を全削除
-                    </button>
-                  </div>
-                  {searchHistory.map((item) => (
-                    <div
-                      key={item}
-                      className="history-dropdown-item"
-                      onClick={() => {
-                        setSearchQuery(item);
-                        setIsSearchFocused(false);
-                        handleSearch(item);
-                      }}
-                    >
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        style={{ width: '15px', height: '15px', flexShrink: 0, opacity: 0.65 }}
-                      >
-                        <circle cx="12" cy="12" r="10" />
-                        <polyline points="12 6 12 12 16 14" />
-                      </svg>
-                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {item}
-                      </span>
+              {/* Search Conversion Preview & History Popover */}
+              {isSearchFocused && (() => {
+                const liveConv = searchConvertEnabled && searchQuery.trim().length > 0
+                  ? convertSearchQuery(searchQuery, true)
+                  : null;
+                const showConv = Boolean(liveConv?.wasConverted);
+                const showHist = searchHistory.length > 0;
+                if (!showConv && !showHist) return null;
+                return (
+                  <div className="search-popover-stack" onMouseDown={(e) => e.preventDefault()}>
+                    {showConv && liveConv && (
                       <button
                         type="button"
-                        className="history-delete-btn"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          removeSearchHistory(item);
-                          setSearchHistory(getSearchHistory());
-                        }}
-                        title="履歴から削除"
+                        className="search-convert-preview"
+                        onClick={() => void handleSearch(liveConv.converted, 1)}
+                        title="変換後のキーワードで検索"
                       >
-                        削除
+                        <span className="material-icons" style={{ fontSize: '14px' }}>auto_fix_high</span>
+                        <span>変換候補: {liveConv.converted}</span>
                       </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+                    )}
+                    {showHist && (
+                      <div id="search-history-dropdown">
+                        <div className="history-dropdown-header">
+                          <span>検索履歴 ({searchHistory.length}件)</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              clearSearchHistory();
+                              setSearchHistory([]);
+                            }}
+                            style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '11px' }}
+                          >
+                            履歴を全削除
+                          </button>
+                        </div>
+                        {searchHistory.map((item) => (
+                          <div
+                            key={item}
+                            className="history-dropdown-item"
+                            onClick={() => {
+                              setSearchQuery(item);
+                              setIsSearchFocused(false);
+                              handleSearch(item);
+                            }}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              style={{ width: '15px', height: '15px', flexShrink: 0, opacity: 0.65 }}
+                            >
+                              <circle cx="12" cy="12" r="10" />
+                              <polyline points="12 6 12 12 16 14" />
+                            </svg>
+                            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {item}
+                            </span>
+                            <button
+                              type="button"
+                              className="history-delete-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removeSearchHistory(item);
+                                setSearchHistory(getSearchHistory());
+                              }}
+                              title="履歴から削除"
+                            >
+                              削除
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </form>
 
@@ -2504,6 +2738,34 @@ export default function App() {
         {/* Main Content Area */}
         <main className="main-content">
           <div className="content-area">
+            {quotaBanner && (
+              <div className="quota-fallback-banner" role="alert">
+                <span className="material-icons">warning_amber</span>
+                <div className="quota-fallback-text">
+                  <strong>{quotaBanner}</strong>
+                  <span>別の中継サーバーへ切り替えると復帰できる場合があります。</span>
+                </div>
+                <div className="quota-fallback-actions">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = rerollAutoNode(autoNodeInfo.baseUrl);
+                      setAutoNodeInfo(next);
+                      const updated = { ...settings, apiRouteMethod: 'auto' as const };
+                      setSettings(updated);
+                      saveSettings(updated);
+                      setApiRouteStatus(`自動選択（分散）: ${next.label}`);
+                      setQuotaBanner(null);
+                    }}
+                  >
+                    別サーバーへ切替
+                  </button>
+                  <button type="button" className="close-quota-btn" onClick={() => setQuotaBanner(null)}>
+                    閉じる
+                  </button>
+                </div>
+              </div>
+            )}
             {/* 1. Home View */}
             <div id="home-view" className={`view ${currentView === 'home' ? 'active' : ''}`}>
               {/* Genre & Term tabs for Home Ranking */}
@@ -2596,11 +2858,12 @@ export default function App() {
                         className="live-alert-chip"
                         onClick={() => void playLiveProgram(alert)}
                       >
-                        <img
+                        <ThumbImg
                           src={alert.providerAvatar || alert.thumbnail}
                           alt={alert.providerName}
                           className="live-alert-chip-avatar"
-                          referrerPolicy="no-referrer"
+                          thumbMethod={settings.thumbMethod}
+                          apiRouteMethod={settings.apiRouteMethod}
                         />
                         <div className="live-alert-chip-meta">
                           <span className="live-alert-chip-name">配信中 · {alert.providerName}</span>
@@ -2624,7 +2887,13 @@ export default function App() {
                   {(homeGenre === 'classics' ? videos : (rankingVideos.length > 0 ? rankingVideos : videos)).map((video, idx) => (
                     <div key={`${video.id}-${idx}`} className="video-card-grid" onClick={() => playVideo(video)}>
                       <div className="video-card-thumb-wrap">
-                        <img src={video.thumbnail} alt={video.title} loading="lazy" referrerPolicy="no-referrer" />
+                        <ThumbImg
+                          src={video.thumbnail}
+                          alt={video.title}
+                          loading="lazy"
+                          thumbMethod={settings.thumbMethod}
+                          apiRouteMethod={settings.apiRouteMethod}
+                        />
                         <span className={`video-rank-tag ${idx < 3 ? 'top3' : ''}`}>
                           #{idx + 1}
                         </span>
@@ -2686,6 +2955,45 @@ export default function App() {
                 </div>
               </div>
 
+              {searchConversion && (searchConversion.wasConverted || searchConversion.alternatives.length > 0) && (
+                <div className="search-conversion-banner">
+                  <div className="search-conversion-main">
+                    <span className="material-icons" style={{ fontSize: '18px', color: 'var(--accent-strong)' }}>auto_fix_high</span>
+                    <div>
+                      {searchConversion.wasConverted ? (
+                        <span>
+                          検索変換: 「<strong>{searchConversion.raw}</strong>」→「<strong>{searchConversion.converted}</strong>」
+                          {searchConversion.reason ? `（${searchConversion.reason}）` : ''}
+                        </span>
+                      ) : (
+                        <span>関連候補キーワード:</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="search-conversion-chips">
+                    {searchConversion.alternatives.map((alt) => (
+                      <button
+                        key={alt}
+                        type="button"
+                        className="search-conversion-chip"
+                        onClick={() => void handleSearch(alt, 1, undefined, true)}
+                      >
+                        {alt} で検索
+                      </button>
+                    ))}
+                    {searchConversion.wasConverted && (
+                      <button
+                        type="button"
+                        className="search-conversion-chip secondary"
+                        onClick={() => void handleSearch(searchConversion.raw, 1, undefined, true)}
+                      >
+                        「{searchConversion.raw}」のまま検索
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {onlineSearchError && (
                 <div style={{ padding: '8px 12px', background: 'rgba(217, 119, 6, 0.14)', border: '1px solid #d97706', borderRadius: '8px', fontSize: '12px', color: 'var(--text-main)', marginBottom: '12px' }}>
                   {onlineSearchError}
@@ -2743,7 +3051,13 @@ export default function App() {
                     (onlineSearchResults !== null ? onlineSearchResults : searchPageVideos).map((video: Video, idx: number) => (
                       <div key={`${video.id}-${idx}`} className="video-card-grid" onClick={() => playVideo(video)}>
                         <div className="video-card-thumb-wrap">
-                          <img src={video.thumbnail} alt={video.title} loading="lazy" referrerPolicy="no-referrer" />
+                          <ThumbImg
+                            src={video.thumbnail}
+                            alt={video.title}
+                            loading="lazy"
+                            thumbMethod={settings.thumbMethod}
+                            apiRouteMethod={settings.apiRouteMethod}
+                          />
                           <span className="video-duration-tag">
                             {video.duration}
                           </span>
@@ -2848,7 +3162,13 @@ export default function App() {
                   playHistory.map((video) => (
                     <div key={video.id} className="video-card-grid" onClick={() => playVideo(video)}>
                       <div className="video-card-thumb-wrap">
-                        <img src={video.thumbnail} alt={video.title} loading="lazy" referrerPolicy="no-referrer" />
+                        <ThumbImg
+                          src={video.thumbnail}
+                          alt={video.title}
+                          loading="lazy"
+                          thumbMethod={settings.thumbMethod}
+                          apiRouteMethod={settings.apiRouteMethod}
+                        />
                         <span className="video-duration-tag">{video.duration}</span>
                       </div>
                       <div className="video-card-body">
@@ -3006,9 +3326,20 @@ export default function App() {
                       <div className="video-grid">
                         {playlists[selectedPlaylistIndex].videos.map((v) => (
                           <div key={v.id} className="video-card-grid" onClick={() => playVideo(v)}>
-                            <img src={v.thumbnail} alt={v.title} loading="lazy" />
-                            <h3>{v.title}</h3>
-                            <p>{v.channel}<br />{v.duration}</p>
+                            <div className="video-card-thumb-wrap">
+                              <ThumbImg
+                                src={v.thumbnail}
+                                alt={v.title}
+                                loading="lazy"
+                                thumbMethod={settings.thumbMethod}
+                                apiRouteMethod={settings.apiRouteMethod}
+                              />
+                              <span className="video-duration-tag">{v.duration}</span>
+                            </div>
+                            <div className="video-card-body">
+                              <h3>{v.title}</h3>
+                              <p>{v.channel}</p>
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -3131,9 +3462,9 @@ export default function App() {
                                   <div className="library-card-actions">
                                     <button
                                       type="button"
-                                      onClick={async () => {
+                                    onClick={async () => {
                                         try {
-                                          const r = await fetch(`/api/nico/mylist/${m.id}`);
+                                          const r = await apiCall(`/api/nico/mylist/${m.id}`);
                                           const d = await r.json();
                                           if (d.success) {
                                             setChannelProfile((prev) => prev ? { ...prev, selectedMylistName: d.name, selectedMylistVideos: d.items || [] } : prev);
@@ -3158,7 +3489,13 @@ export default function App() {
                               {channelProfile.selectedMylistVideos.map((v) => (
                                 <div key={v.id} className="video-card-grid" onClick={() => playVideo(v)}>
                                   <div className="video-card-thumb-wrap">
-                                    <img src={v.thumbnail} alt={v.title} loading="lazy" referrerPolicy="no-referrer" />
+                                    <ThumbImg
+                                      src={v.thumbnail}
+                                      alt={v.title}
+                                      loading="lazy"
+                                      thumbMethod={settings.thumbMethod}
+                                      apiRouteMethod={settings.apiRouteMethod}
+                                    />
                                     <span className="video-duration-tag">{v.duration}</span>
                                   </div>
                                   <div className="video-card-body">
@@ -3179,7 +3516,13 @@ export default function App() {
                         ).map((video) => (
                           <div key={video.id} className="video-card-grid" onClick={() => playVideo(video)}>
                             <div className="video-card-thumb-wrap">
-                              <img src={video.thumbnail} alt={video.title} loading="lazy" referrerPolicy="no-referrer" />
+                              <ThumbImg
+                                src={video.thumbnail}
+                                alt={video.title}
+                                loading="lazy"
+                                thumbMethod={settings.thumbMethod}
+                                apiRouteMethod={settings.apiRouteMethod}
+                              />
                               <span className="video-duration-tag">{video.duration}</span>
                             </div>
                             <div className="video-card-body">
@@ -3430,7 +3773,13 @@ export default function App() {
                               onClick={() => void playLiveProgram(p)}
                             >
                               <div className="video-card-thumb-wrap">
-                                <img src={p.thumbnail} alt={p.title} loading="lazy" referrerPolicy="no-referrer" />
+                                <ThumbImg
+                                  src={p.thumbnail}
+                                  alt={p.title}
+                                  loading="lazy"
+                                  thumbMethod={settings.thumbMethod}
+                                  apiRouteMethod={settings.apiRouteMethod}
+                                />
                                 <span className="video-rank-tag top3">
                                   LIVE
                                 </span>
@@ -3460,7 +3809,7 @@ export default function App() {
                         setSeigaLoading(true);
                         setSeigaError(null);
                         try {
-                          const r = await fetch(`/api/nico/seiga/${encodeURIComponent(seigaInput.trim())}`);
+                          const r = await apiCall(`/api/nico/seiga/${encodeURIComponent(seigaInput.trim())}`);
                           const d = await r.json();
                           if (!d.success) throw new Error(d.error || '取得失敗');
                           setSeigaResult(d.illust);
@@ -3488,7 +3837,13 @@ export default function App() {
                     {seigaError && <p style={{ color: '#dc2626', fontSize: '13px' }}>{seigaError}</p>}
                     {seigaResult && (
                       <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
-                        <img src={seigaResult.thumbnailUrl} alt={seigaResult.title} referrerPolicy="no-referrer" style={{ maxWidth: '240px', borderRadius: '8px', background: '#000' }} />
+                        <ThumbImg
+                          src={seigaResult.thumbnailUrl}
+                          alt={seigaResult.title}
+                          thumbMethod={settings.thumbMethod}
+                          apiRouteMethod={settings.apiRouteMethod}
+                          style={{ maxWidth: '240px', borderRadius: '8px', background: '#000' }}
+                        />
                         <div style={{ flex: '1 1 240px' }}>
                           <h3 style={{ margin: '0 0 6px' }}>{seigaResult.title}</h3>
                           <p className="tabular-nums" style={{ margin: '0 0 8px', color: 'var(--text-muted)', fontSize: '13px' }}>
@@ -3512,7 +3867,7 @@ export default function App() {
                         setDicLoading(true);
                         setDicError(null);
                         try {
-                          const r = await fetch(`/api/nico/dic/${encodeURIComponent(dicInput.trim())}`);
+                          const r = await apiCall(`/api/nico/dic/${encodeURIComponent(dicInput.trim())}`);
                           const d = await r.json();
                           if (!d.success) throw new Error(d.error || '取得失敗');
                           setDicResult(d);
@@ -3577,7 +3932,7 @@ export default function App() {
                           try {
                             const end = Math.floor(Date.now() / 1000);
                             const start = end - 1800;
-                            const r = await fetch(`/api/nico/jikkyo?channel=${encodeURIComponent(jikkyoChannel)}&starttime=${start}&endtime=${end}`);
+                            const r = await apiCall(`/api/nico/jikkyo?channel=${encodeURIComponent(jikkyoChannel)}&starttime=${start}&endtime=${end}`);
                             const d = await r.json();
                             if (!d.success) throw new Error(d.error || '取得失敗');
                             setJikkyoLogs(d.packets || []);
@@ -3732,10 +4087,11 @@ export default function App() {
                   <div className="zero-surface-box" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                     <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
                       {dlInspectedInfo.thumbnail && (
-                        <img
+                        <ThumbImg
                           src={dlInspectedInfo.thumbnail}
                           alt={dlInspectedInfo.title}
-                          referrerPolicy="no-referrer"
+                          thumbMethod={settings.thumbMethod}
+                          apiRouteMethod={settings.apiRouteMethod}
                           style={{ width: '200px', aspectRatio: '16 / 9', objectFit: 'cover', borderRadius: '8px', background: '#000' }}
                         />
                       )}
@@ -3935,10 +4291,10 @@ export default function App() {
                 </section>
 
                 <section className="settings-section">
-                  <h3 className="settings-section-title"><span className="material-icons">play_circle</span>動画再生方式</h3>
-                  <p className="settings-section-note">途切れを防止するため、本体サーバーの高速ストリーミングを使用します。</p>
+                  <h3 className="settings-section-title"><span className="material-icons">play_circle</span>動画再生・検索・字幕</h3>
+                  <p className="settings-section-note">自動再生、動画内字幕の挿入、検索キーワード自動変換を切り替えます。</p>
                   <div className="setting-group">
-                    <label className="setting-label">再生方式</label>
+                    <label className="setting-label" htmlFor="nicoPlayMethod">再生方式</label>
                     <select
                       id="nicoPlayMethod"
                       value={settings.nicoPlayMethod}
@@ -3952,6 +4308,54 @@ export default function App() {
                       <option value="direct">直接リンク再生</option>
                     </select>
                   </div>
+                  <div className="setting-group">
+                    <label className="setting-label" htmlFor="autoPlayMode">動画の自動再生</label>
+                    <select
+                      id="autoPlayMode"
+                      value={autoPlayEnabled ? 'on' : 'off'}
+                      onChange={(e) => {
+                        const next = e.target.value === 'on';
+                        const updated = { ...settings, autoPlay: next };
+                        setSettings(updated);
+                        saveSettings(updated);
+                      }}
+                    >
+                      <option value="on">ON (デフォルト・自動で再生開始)</option>
+                      <option value="off">OFF (読み込み後に手動で再生)</option>
+                    </select>
+                  </div>
+                  <div className="setting-group">
+                    <label className="setting-label" htmlFor="subtitleMode">動画内字幕の挿入</label>
+                    <select
+                      id="subtitleMode"
+                      value={subtitleEnabled ? 'on' : 'off'}
+                      onChange={(e) => {
+                        const next = e.target.value === 'on';
+                        const updated = { ...settings, subtitleEnabled: next };
+                        setSettings(updated);
+                        saveSettings(updated);
+                      }}
+                    >
+                      <option value="on">ON (デフォルト・コメント/VTT/SRTを字幕表示)</option>
+                      <option value="off">OFF (字幕を非表示)</option>
+                    </select>
+                  </div>
+                  <div className="setting-group">
+                    <label className="setting-label" htmlFor="searchConvertMode">検索キーワード変換</label>
+                    <select
+                      id="searchConvertMode"
+                      value={searchConvertEnabled ? 'on' : 'off'}
+                      onChange={(e) => {
+                        const next = e.target.value === 'on';
+                        const updated = { ...settings, searchConvertEnabled: next };
+                        setSettings(updated);
+                        saveSettings(updated);
+                      }}
+                    >
+                      <option value="on">ON (デフォルト・ローマ字/全角半角/略称を自動変換)</option>
+                      <option value="off">OFF (入力した文字のまま検索)</option>
+                    </select>
+                  </div>
                 </section>
 
                 <section className="settings-section">
@@ -3961,48 +4365,93 @@ export default function App() {
                         <span className="material-icons">cloud</span>API中継サーバー一覧
                       </h3>
                       <p className="settings-section-note" style={{ marginBottom: 0 }}>
-                        実測の応答速度と用途を比較して接続先を選択できます。
+                        実測の応答速度と用途を比較して接続先を選択できます（Render 3台＋Cloudflare Worker＋Vercel API対応）。
                       </p>
                     </div>
-                    <button
-                      type="button"
-                      className="api-retest-btn"
-                      onClick={() => void measureApiServers()}
-                      disabled={isMeasuringApis}
-                    >
-                      <span className={`material-icons${isMeasuringApis ? ' spin-icon' : ''}`} style={{ fontSize: '15px' }}>refresh</span>
-                      {isMeasuringApis ? '測定中...' : '速度を再測定'}
-                    </button>
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="api-retest-btn"
+                        onClick={() => {
+                          const next = rerollAutoNode(autoNodeInfo.baseUrl);
+                          setAutoNodeInfo(next);
+                          if (settings.apiRouteMethod === 'auto') {
+                            setApiRouteStatus(`自動選択（分散）: ${next.label}`);
+                          }
+                          void measureApiServers();
+                        }}
+                        disabled={isMeasuringApis}
+                      >
+                        <span className="material-icons" style={{ fontSize: '15px' }}>shuffle</span>
+                        分散先を変更
+                      </button>
+                      <button
+                        type="button"
+                        className="api-retest-btn"
+                        onClick={() => void measureApiServers()}
+                        disabled={isMeasuringApis}
+                      >
+                        <span className={`material-icons${isMeasuringApis ? ' spin-icon' : ''}`} style={{ fontSize: '15px' }}>refresh</span>
+                        {isMeasuringApis ? '測定中...' : '速度を再測定'}
+                      </button>
+                    </div>
                   </div>
 
                   <div className="api-route-list" role="radiogroup" aria-label="API中継サーバー一覧">
                     {[
                       {
                         id: 'auto' as const,
-                        name: '自動選択（メインサーバー優先）',
+                        name: '自動選択（分散）',
                         badge: '推奨・標準',
                         recommended: true,
-                        urlLabel: '同一オリジン (/api/*)',
-                        desc: '通常の検索・動画・コメント取得を最短経路で安定処理します。',
-                        typical: '目安 0.1〜0.5秒'
+                        urlLabel: `現在割り当て中: ${autoNodeInfo.label}`,
+                        desc: '初回アクセス時にWorker/Render/Vercelへ分散し、1つの無料枠枯渇と混雑を防ぎます。',
+                        typical: '目安 0.1〜0.6秒'
                       },
                       {
                         id: 'worker' as const,
                         name: 'Cloudflare Worker（東京エッジ中継）',
-                        badge: '推奨・生放送高速',
+                        badge: '推奨・1.5秒共有キャッシュ',
                         recommended: true,
                         urlLabel: 'https://niconico-2.na8526130.workers.dev',
-                        desc: '東京エッジ経由でHLSセグメントや生放送検索を低遅延中継します。',
-                        typical: '目安 0.05〜0.47秒'
+                        desc: '東京エッジ経由＋生放送HLS 1.5秒共有キャッシュ＋3台Render自動フェイルオーバー。',
+                        typical: '目安 0.05〜0.50秒'
                       },
                       {
                         id: 'render' as const,
-                        name: 'Render（常駐APIサーバー）',
+                        name: 'Render #1（常駐APIサーバー）',
                         badge: '座席維持対応',
                         recommended: false,
-                        urlLabel: 'https://nikoniko-4.onrender.com',
-                        desc: '生放送WebSocket（keepSeat）常駐サーバー。15分無通信でスリープします。',
+                        urlLabel: RENDER_SERVER_URLS[0],
+                        desc: '1台目の常駐Renderノード。生放送WebSocketや動画ストリーム取得を担当します。',
                         typical: '稼働時 0.36〜1.2秒'
+                      },
+                      {
+                        id: 'render2' as const,
+                        name: 'Render #2（分散APIサーバー）',
+                        badge: '追加ノード',
+                        recommended: false,
+                        urlLabel: RENDER_SERVER_URLS[1],
+                        desc: '2台目のRenderノード。アクセス集中時や1台目満員時の分散先として動作します。',
+                        typical: '稼働時 0.36〜1.2秒'
+                      },
+                      {
+                        id: 'render3' as const,
+                        name: 'Render #3（分散APIサーバー）',
+                        badge: '追加ノード',
+                        recommended: false,
+                        urlLabel: RENDER_SERVER_URLS[2],
+                        desc: '3台目のRenderノード。3台並列で生放送・検索・Base64サムネの負荷を分散します。',
+                        typical: '稼働時 0.36〜1.2秒'
+                      },
+                      {
+                        id: 'vercel' as const,
+                        name: 'Vercel サーバーAPI',
+                        badge: 'Serverless',
+                        recommended: false,
+                        urlLabel: getConfiguredVercelUrl() || '同一オリジン (/api/*) または下のURL欄で指定',
+                        desc: 'VercelのServerless Functions (/api/*) をサーバーAPIとして使用します。外部Vercel URLの指定も可能です。',
+                        typical: '目安 0.15〜0.80秒'
                       },
                       {
                         id: 'direct' as const,
@@ -4042,9 +4491,12 @@ export default function App() {
                             setSettings(updated);
                             saveSettings(updated);
                             if (srv.id === 'worker') setApiRouteStatus('Cloudflare Worker (niconico-2.na8526130.workers.dev) を使用中');
-                            else if (srv.id === 'render') setApiRouteStatus('Render (nikoniko-4.onrender.com) を使用中');
+                            else if (srv.id === 'render') setApiRouteStatus(`Render #1 (${RENDER_SERVER_URLS[0]}) を使用中`);
+                            else if (srv.id === 'render2') setApiRouteStatus(`Render #2 (${RENDER_SERVER_URLS[1]}) を使用中`);
+                            else if (srv.id === 'render3') setApiRouteStatus(`Render #3 (${RENDER_SERVER_URLS[2]}) を使用中`);
+                            else if (srv.id === 'vercel') setApiRouteStatus(`Vercel API (${getConfiguredVercelUrl() || '同一オリジン /api/*'}) を使用中`);
                             else if (srv.id === 'direct') setApiRouteStatus('メインサーバー直通を使用中');
-                            else setApiRouteStatus('自動選択: メインサーバーを使用中');
+                            else setApiRouteStatus(`自動選択（分散）: ${autoNodeInfo.label}`);
                           }}
                         >
                           <div className="api-route-main">
@@ -4072,11 +4524,45 @@ export default function App() {
                     })}
                   </div>
 
+                  <div className="vercel-url-row">
+                    <label className="setting-label" htmlFor="vercel-api-url-input" style={{ marginBottom: '4px' }}>
+                      外部 Vercel API URL（任意・VercelにデプロイしたURL）
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <input
+                        id="vercel-api-url-input"
+                        type="url"
+                        className="zero-input"
+                        style={{ flex: '1 1 220px' }}
+                        placeholder="https://your-app.vercel.app"
+                        value={vercelUrlDraft}
+                        onChange={(e) => setVercelUrlDraft(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="zero-secondary-btn"
+                        onClick={() => {
+                          const cleaned = vercelUrlDraft.trim().replace(/\/+$/, '');
+                          const updated = { ...settings, vercelApiUrl: cleaned };
+                          setSettings(updated);
+                          saveSettings(updated);
+                          setAutoNodeInfo(getAutoNodeDisplayInfo());
+                          if (settings.apiRouteMethod === 'vercel') {
+                            setApiRouteStatus(`Vercel API (${cleaned || '同一オリジン /api/*'}) を使用中`);
+                          }
+                          void measureApiServers();
+                        }}
+                      >
+                        Vercel URLを保存
+                      </button>
+                    </div>
+                  </div>
+
                   <p id="api-route-status" className="api-route-status" aria-live="polite">{apiRouteStatus}</p>
-                  <p className="setting-hint">※通常は「自動選択」または「Cloudflare Worker」がおすすめです。</p>
+                  <p className="setting-hint">※通常は「自動選択（分散）」または「Cloudflare Worker」がおすすめです。</p>
 
                   <div className="setting-group">
-                    <label className="setting-label">サムネイルの取得方法</label>
+                    <label className="setting-label" htmlFor="thumbMethod">サムネイルの取得方法</label>
                     <select
                       id="thumbMethod"
                       value={settings.thumbMethod}
@@ -4086,10 +4572,10 @@ export default function App() {
                         saveSettings(updated);
                       }}
                     >
-                      <option value="direct">直接リンク (デフォルト)</option>
-                      <option value="server">サーバー経由 (Base64・安全)</option>
+                      <option value="server">サーバー経由 Base64 (デフォルト・安全)</option>
+                      <option value="direct">直接リンク (ブラウザ直読)</option>
                     </select>
-                    <p className="setting-hint">「サーバー経由」はIPを隠して取得します。</p>
+                    <p className="setting-hint">「Base64」はサーバー経由で画像をData URL変換して取得し、直リンクのブロックやIP露出を防ぎます。</p>
                   </div>
                 </section>
               </div>
@@ -4392,11 +4878,12 @@ export default function App() {
                             <div className="radio-mode-card-row">
                               <div className="radio-mode-art-wrap">
                                 {currentVideo.thumbnail ? (
-                                  <img
+                                  <ThumbImg
                                     src={currentVideo.thumbnail}
                                     alt={currentVideo.title}
                                     className="radio-mode-art"
-                                    referrerPolicy="no-referrer"
+                                    thumbMethod={settings.thumbMethod}
+                                    apiRouteMethod={settings.apiRouteMethod}
                                   />
                                 ) : (
                                   <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -4420,7 +4907,7 @@ export default function App() {
                               className="radio-mode-audio"
                               src={playerMode === 'custom' && currentVideo ? getStreamUrl(currentVideo) : undefined}
                               controls
-                              autoPlay
+                              autoPlay={autoPlayEnabled}
                               playsInline
                               preload="auto"
                               loop={playerLoop}
@@ -4429,7 +4916,8 @@ export default function App() {
                                 setIsVideoLoading(false);
                               }}
                               onPause={() => setIsVideoPlaying(false)}
-                              onLoadedMetadata={() => {
+                              onLoadedMetadata={(e) => {
+                                if (!autoPlayRef.current) e.currentTarget.pause();
                                 setIsVideoLoading(false);
                                 setVideoLoadingPercent(100);
                               }}
@@ -4471,7 +4959,7 @@ export default function App() {
                             ref={videoRef}
                             src={playerMode === 'custom' && currentVideo ? getStreamUrl(currentVideo) : undefined}
                             controls
-                            autoPlay
+                            autoPlay={autoPlayEnabled}
                             playsInline
                             preload="auto"
                             loop={playerLoop}
@@ -4480,7 +4968,8 @@ export default function App() {
                               setIsVideoLoading(false);
                             }}
                             onPause={() => setIsVideoPlaying(false)}
-                            onLoadedMetadata={() => {
+                            onLoadedMetadata={(e) => {
+                              if (!autoPlayRef.current) e.currentTarget.pause();
                               setIsVideoLoading(false);
                               setVideoLoadingPercent(100);
                             }}
@@ -4506,7 +4995,11 @@ export default function App() {
                               setIsVideoPlaying(false);
                             }}
                             style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
-                          />
+                          >
+                            {subtitleEnabled && subtitleVttUrl && (
+                              <track kind="subtitles" srcLang="ja" label="日本語字幕" src={subtitleVttUrl} default />
+                            )}
+                          </video>
                         )}
 
                         {/* Big Centered Play Button when media is paused & ready */}
@@ -4687,6 +5180,27 @@ export default function App() {
                             <p style={{ color: '#fff', fontSize: '15px', fontWeight: 'bold', marginBottom: '6px' }}>動画の読み込み</p>
                             <p style={{ color: '#bbb', fontSize: '13px', marginBottom: '18px', maxWidth: '380px' }}>{videoError}</p>
                             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                              {currentVideo?.isLive && videoError.includes('満員') && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setVideoError(null);
+                                    switchView('home');
+                                  }}
+                                  style={{
+                                    padding: '10px 18px',
+                                    background: '#16a34a',
+                                    color: '#fff',
+                                    border: 'none',
+                                    borderRadius: '8px',
+                                    fontWeight: 'bold',
+                                    fontSize: '13px',
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  通常動画一覧を見る
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => {
@@ -4754,6 +5268,13 @@ export default function App() {
                                 {d.text}
                               </div>
                             ))}
+                          </div>
+                        )}
+
+                        {/* Video Subtitle Overlay (bottom center) */}
+                        {subtitleEnabled && !radioMode && activeSubtitleText && (
+                          <div className="video-subtitle-overlay" aria-live="polite">
+                            {activeSubtitleText}
                           </div>
                         )}
 
@@ -4828,6 +5349,27 @@ export default function App() {
                               </select>
                             </div>
                             <button
+                              type="button"
+                              className="overlay-btn"
+                              onClick={() => {
+                                const next = !subtitleEnabled;
+                                const updated = { ...settings, subtitleEnabled: next };
+                                setSettings(updated);
+                                saveSettings(updated);
+                                showPlayerNotification(next ? '動画字幕をONにしました' : '動画字幕をOFFにしました');
+                              }}
+                            >
+                              字幕: {subtitleEnabled ? 'ON' : 'OFF'}
+                            </button>
+                            <button
+                              type="button"
+                              className="overlay-btn"
+                              onClick={() => subtitleFileInputRef.current?.click()}
+                            >
+                              字幕読込 (.vtt/.srt)
+                            </button>
+                            <button
+                              type="button"
                               className="overlay-btn loop-toggle"
                               onClick={() => {
                                 const next = !playerLoop;
@@ -4923,6 +5465,80 @@ export default function App() {
                         >
                           コメント: {nicoCommentsOn ? 'ON' : 'OFF'}
                         </button>
+
+                        <button
+                          className="action-btn"
+                          id="subtitle-toggle-main"
+                          type="button"
+                          onClick={() => {
+                            const next = !subtitleEnabled;
+                            const updated = { ...settings, subtitleEnabled: next };
+                            setSettings(updated);
+                            saveSettings(updated);
+                            showPlayerNotification(next ? '動画字幕をONにしました' : '動画字幕をOFFにしました');
+                          }}
+                          style={{
+                            color: subtitleEnabled ? 'var(--accent-strong)' : 'var(--text-main)',
+                            borderColor: subtitleEnabled ? 'var(--accent)' : undefined,
+                            background: subtitleEnabled ? 'var(--accent-soft)' : undefined
+                          }}
+                        >
+                          <span className="material-icons" style={{ fontSize: '17px' }}>subtitles</span>
+                          字幕: {subtitleEnabled ? 'ON' : 'OFF'}
+                        </button>
+
+                        <input
+                          ref={subtitleFileInputRef}
+                          type="file"
+                          accept=".vtt,.srt,text/vtt,application/x-subrip"
+                          style={{ display: 'none' }}
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            e.target.value = '';
+                            if (!file) return;
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              const cues = parseSubtitleFileText(String(reader.result || ''));
+                              if (cues.length === 0) {
+                                showPlayerNotification('有効なVTT/SRT字幕を読み込めませんでした');
+                                return;
+                              }
+                              setCustomSubtitles(cues);
+                              if (!subtitleEnabled) {
+                                const updated = { ...settings, subtitleEnabled: true };
+                                setSettings(updated);
+                                saveSettings(updated);
+                              }
+                              showPlayerNotification(`字幕ファイルを読み込みました (${cues.length}件)`);
+                            };
+                            reader.readAsText(file, 'utf-8');
+                          }}
+                        />
+
+                        <button
+                          className="action-btn"
+                          id="subtitle-upload-btn"
+                          type="button"
+                          onClick={() => subtitleFileInputRef.current?.click()}
+                          title=".vtt または .srt 字幕ファイルを読み込む"
+                        >
+                          <span className="material-icons" style={{ fontSize: '17px' }}>upload_file</span>
+                          {customSubtitles ? `字幕(${customSubtitles.length})` : '字幕読込'}
+                        </button>
+
+                        {customSubtitles && (
+                          <button
+                            className="action-btn"
+                            type="button"
+                            onClick={() => {
+                              setCustomSubtitles(null);
+                              showPlayerNotification('カスタム字幕を解除しました（自動字幕に戻ります）');
+                            }}
+                            title="読み込んだ字幕ファイルを解除"
+                          >
+                            字幕解除
+                          </button>
+                        )}
 
                         <button
                           className="action-btn"
@@ -5301,7 +5917,13 @@ export default function App() {
                         <div id="related-results" className="related-list">
                           {relatedVideos.map((r) => (
                             <div key={r.id} className="related-card" onClick={() => playVideo(r)}>
-                              <img src={r.thumbnail} alt={r.title} loading="lazy" />
+                              <ThumbImg
+                                src={r.thumbnail}
+                                alt={r.title}
+                                loading="lazy"
+                                thumbMethod={settings.thumbMethod}
+                                apiRouteMethod={settings.apiRouteMethod}
+                              />
                               <div className="related-info">
                                 <h4>{r.title}</h4>
                                 <p>{r.channel}<br />{r.views.toLocaleString()}回視聴</p>
@@ -5394,7 +6016,7 @@ export default function App() {
                   <video
                     ref={floatingVideoRef}
                     src={playerMode === 'freemake' && freemakeResolvedUrl ? freemakeResolvedUrl : getStreamUrl(currentVideo)}
-                    autoPlay
+                    autoPlay={autoPlayEnabled}
                     playsInline
                     loop={playerLoop}
                     onError={() => setPlayerMode('embed')}

@@ -125,9 +125,13 @@ export interface LiveChatComment {
 }
 
 export interface AppSettings {
-  apiRouteMethod: 'auto' | 'direct' | 'render' | 'worker' | 'gas';
+  apiRouteMethod: 'auto' | 'direct' | 'render' | 'render2' | 'render3' | 'worker' | 'vercel' | 'gas';
   thumbMethod: 'direct' | 'server';
   nicoPlayMethod: 'proxy' | 'direct';
+  autoPlay?: boolean;
+  subtitleEnabled?: boolean;
+  searchConvertEnabled?: boolean;
+  vercelApiUrl?: string;
   danmakuSpeed: number; // in seconds, default 8
   danmakuFontSize: number; // default 24
 }

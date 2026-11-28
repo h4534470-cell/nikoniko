@@ -184,9 +184,9 @@ function createApiApp() {
   app2.use("/videos", express.static(VIDEOS_CACHE_DIR));
   app2.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE");
-    res.setHeader("Access-Control-Allow-Headers", "X-Requested-With,content-type,Range,range");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Range,Content-Length,Accept-Ranges");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, PATCH, DELETE, HEAD");
+    res.setHeader("Access-Control-Allow-Headers", "X-Requested-With, Content-Type, Authorization, Range, X-Viewer-Id");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges, Content-Type");
     if (req.method === "OPTIONS") {
       return res.sendStatus(204);
     }
@@ -202,6 +202,63 @@ function createApiApp() {
       vercel: IS_VERCEL
     });
   });
+  const thumbBase64Cache = /* @__PURE__ */ new Map();
+  const handleThumbBase64 = async (req, res) => {
+    const rawUrl = String(req.query.url || "").trim();
+    if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+      return res.status(400).json({ ok: false, success: false, error: "\u6709\u52B9\u306A\u753B\u50CFURL\u3092\u6307\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044" });
+    }
+    let parsed;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      return res.status(400).json({ ok: false, success: false, error: "Invalid URL" });
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host.endsWith(".local") || host.endsWith(".internal") || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) || host === "::1") {
+      return res.status(403).json({ ok: false, success: false, error: "Forbidden host" });
+    }
+    const now = Date.now();
+    const cached = thumbBase64Cache.get(rawUrl);
+    if (cached && cached.expiresAt > now) {
+      res.setHeader("Cache-Control", "public, max-age=900, s-maxage=900");
+      return res.json({ ok: true, success: true, cached: true, dataUrl: cached.dataUrl });
+    }
+    try {
+      const resp = await fetch(parsed.toString(), {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Referer": "https://www.nicovideo.jp/"
+        },
+        signal: AbortSignal.timeout(6e3)
+      });
+      if (!resp.ok) {
+        return res.status(resp.status).json({ ok: false, success: false, error: "\u30B5\u30E0\u30CD\u30A4\u30EB\u306E\u53D6\u5F97\u306B\u5931\u6557\u3057\u307E\u3057\u305F" });
+      }
+      const ct = (resp.headers.get("content-type") || "image/jpeg").split(";")[0].trim().toLowerCase();
+      if (!ct.startsWith("image/")) {
+        return res.status(415).json({ ok: false, success: false, error: "\u753B\u50CF\u4EE5\u5916\u306E\u30EC\u30B9\u30DD\u30F3\u30B9\u3067\u3059" });
+      }
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > 2 * 1024 * 1024) {
+        return res.status(413).json({ ok: false, success: false, error: "\u753B\u50CF\u30B5\u30A4\u30BA\u304C\u5927\u304D\u3059\u304E\u307E\u3059" });
+      }
+      const dataUrl = `data:${ct};base64,${buf.toString("base64")}`;
+      if (thumbBase64Cache.size > 300) {
+        for (const [k, v] of thumbBase64Cache.entries()) {
+          if (v.expiresAt <= now) thumbBase64Cache.delete(k);
+        }
+        if (thumbBase64Cache.size > 300) thumbBase64Cache.clear();
+      }
+      thumbBase64Cache.set(rawUrl, { dataUrl, expiresAt: now + 15 * 60 * 1e3 });
+      res.setHeader("Cache-Control", "public, max-age=900, s-maxage=900");
+      return res.json({ ok: true, success: true, cached: false, dataUrl });
+    } catch (err) {
+      return res.status(502).json({ ok: false, success: false, error: err?.message || "\u30B5\u30E0\u30CD\u30A4\u30EB\u5909\u63DB\u30A8\u30E9\u30FC" });
+    }
+  };
+  app2.get("/api/thumb-base64", handleThumbBase64);
+  app2.get("/api/nico-base64", handleThumbBase64);
   function formatSecToDuration(sec) {
     const total = Math.max(0, Math.floor(Number(sec) || 0));
     const h = Math.floor(total / 3600);
@@ -940,18 +997,30 @@ Cookie: ${allCookies}\r
     const liveIdMatch = targetUrl.match(/\b(lv\d+)\b/i);
     if (liveIdMatch) {
       const lvId = liveIdMatch[1].toLowerCase();
-      const liveQuality = audioOnly ? "audio_only" : "high";
+      const reqLiveQ = String(req.query.liveQuality || req.query.quality || "").toLowerCase();
+      const liveQuality = audioOnly ? "audio_only" : reqLiveQ === "high" ? "high" : reqLiveQ === "normal" ? "normal" : "low";
+      const viewerKey = getViewerKey(req, lvId);
+      if (!hasLiveCapacity(lvId, liveQuality, viewerKey)) {
+        return res.status(503).json({
+          ok: false,
+          success: false,
+          code: "LIVE_CAPACITY_FULL",
+          error: "\u73FE\u5728\u751F\u653E\u9001\u306E\u8996\u8074\u67A0\u304C\u6E80\u54E1\u3067\u3059\uFF08\u901A\u5E38\u52D5\u753B\u306F\u5229\u7528\u3067\u304D\u307E\u3059\uFF09"
+        });
+      }
       try {
         const liveSess = await getOrCreateNicoLiveSession(lvId, false, liveQuality);
         if (liveSess?.streamUri) {
+          touchLiveViewer(lvId, viewerKey);
           return res.json({
             ok: true,
             mode: "hls",
             platform: "niconico-live",
             isLive: true,
             isAudioOnly: audioOnly,
-            streamUrl: `/api/nico/live/hls/${encodeURIComponent(lvId)}/master.m3u8${audioOnly ? "?quality=audio_only" : ""}`,
-            qualities: ["720", "480", "360"]
+            liveQuality: liveSess.qualityMode,
+            streamUrl: `/api/nico/live/hls/${encodeURIComponent(lvId)}/master.m3u8?quality=${encodeURIComponent(liveSess.qualityMode)}`,
+            qualities: ["360", "480"]
           });
         }
       } catch (err) {
@@ -2754,8 +2823,68 @@ Cookie: ${allCookies}\r
       return res.json({ success: false, parents: [], children: [], parentsTotal: 0, childrenTotal: 0 });
     }
   });
+  const MAX_LIVE_SESSIONS_PER_INSTANCE = Math.max(1, parseInt(process.env.MAX_LIVE_SESSIONS || "8", 10) || 8);
+  const MAX_LIVE_VIEWERS_PER_INSTANCE = Math.max(1, parseInt(process.env.MAX_LIVE_VIEWERS || "10", 10) || 10);
+  const LIVE_VIEWER_TTL_MS = 65e3;
+  const LIVE_MICRO_CACHE_TTL_MS = 1500;
   const nicoLiveSessions = /* @__PURE__ */ new Map();
   const nicoLivePending = /* @__PURE__ */ new Map();
+  const liveActiveViewers = /* @__PURE__ */ new Map();
+  const liveMicroCache = /* @__PURE__ */ new Map();
+  function getViewerKey(req, lvId) {
+    const qVid = sanitizeId(String(req.query.vid || req.headers["x-viewer-id"] || "")).trim();
+    if (qVid && qVid !== "video") return `${qVid}:${lvId}`;
+    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    const ip = fwd || req.ip || "anon";
+    return `${ip}:${lvId}`;
+  }
+  function pruneExpiredLiveState() {
+    const now = Date.now();
+    for (const [k, v] of liveActiveViewers.entries()) {
+      if (v.expiresAt <= now) liveActiveViewers.delete(k);
+    }
+    for (const [k, s] of nicoLiveSessions.entries()) {
+      if (now - s.lastActive > 18e4) {
+        closeLiveSessionByKey(k);
+      }
+    }
+    if (liveMicroCache.size > 250) {
+      for (const [k, v] of liveMicroCache.entries()) {
+        if (v.expiresAt <= now) liveMicroCache.delete(k);
+      }
+      if (liveMicroCache.size > 250) liveMicroCache.clear();
+    }
+  }
+  function touchLiveViewer(lvId, viewerKey) {
+    pruneExpiredLiveState();
+    liveActiveViewers.set(viewerKey, { lvId, expiresAt: Date.now() + LIVE_VIEWER_TTL_MS });
+  }
+  function hasLiveCapacity(lvId, qualityMode, viewerKey) {
+    pruneExpiredLiveState();
+    if (liveActiveViewers.has(viewerKey)) return true;
+    if (liveActiveViewers.size >= MAX_LIVE_VIEWERS_PER_INSTANCE) return false;
+    const sessionKey = `${lvId}:${qualityMode}`;
+    if (nicoLiveSessions.has(sessionKey)) return true;
+    return nicoLiveSessions.size < MAX_LIVE_SESSIONS_PER_INSTANCE;
+  }
+  function getCachedLivePayload(cacheKey) {
+    const entry = liveMicroCache.get(cacheKey);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      liveMicroCache.delete(cacheKey);
+      return null;
+    }
+    return entry;
+  }
+  function setCachedLivePayload(cacheKey, status, contentType, body) {
+    if (status < 200 || status >= 300) return;
+    liveMicroCache.set(cacheKey, {
+      expiresAt: Date.now() + LIVE_MICRO_CACHE_TTL_MS,
+      status,
+      contentType,
+      body
+    });
+  }
   function closeLiveSessionByKey(key) {
     const old = nicoLiveSessions.get(key);
     if (old) {
@@ -2781,12 +2910,10 @@ Cookie: ${allCookies}\r
     }
     return pairs.join("; ");
   }
-  async function getOrCreateNicoLiveSession(lvId, forceRefresh = false, qualityMode = "high") {
+  async function getOrCreateNicoLiveSession(lvId, forceRefresh = false, qualityMode = "low") {
     const cleanId = sanitizeId(lvId).toLowerCase();
     if (!/^lv\d+$/.test(cleanId)) return null;
     const sessionKey = `${cleanId}:${qualityMode}`;
-    const oppositeKey = `${cleanId}:${qualityMode === "audio_only" ? "high" : "audio_only"}`;
-    closeLiveSessionByKey(oppositeKey);
     if (!forceRefresh) {
       const existing = nicoLiveSessions.get(sessionKey);
       if (existing && existing.streamUri && Date.now() - existing.lastActive < 1e3 * 60 * 3 && existing.ws?.readyState === WebSocket.OPEN) {
@@ -2980,9 +3107,9 @@ Cookie: ${allCookies}\r
   }
   app2.post("/api/nico/live/heartbeat/:id", async (req, res) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
-    const high = nicoLiveSessions.get(`${cleanId}:high`);
-    const audio = nicoLiveSessions.get(`${cleanId}:audio_only`);
-    const active = high || audio;
+    const viewerKey = getViewerKey(req, cleanId);
+    touchLiveViewer(cleanId, viewerKey);
+    const active = nicoLiveSessions.get(`${cleanId}:low`) || nicoLiveSessions.get(`${cleanId}:normal`) || nicoLiveSessions.get(`${cleanId}:high`) || nicoLiveSessions.get(`${cleanId}:audio_only`);
     if (active) {
       active.lastActive = Date.now();
       if (active.ws?.readyState === WebSocket.OPEN) {
@@ -2991,15 +3118,47 @@ Cookie: ${allCookies}\r
         } catch {
         }
       }
-      return res.json({ success: true, active: true });
+      return res.json({
+        success: true,
+        active: true,
+        viewers: liveActiveViewers.size,
+        maxViewers: MAX_LIVE_VIEWERS_PER_INSTANCE
+      });
     }
-    return res.json({ success: true, active: false });
+    return res.json({
+      success: true,
+      active: false,
+      viewers: liveActiveViewers.size,
+      maxViewers: MAX_LIVE_VIEWERS_PER_INSTANCE
+    });
   });
   app2.post("/api/nico/live/stop/:id", (req, res) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
-    closeLiveSessionByKey(`${cleanId}:high`);
-    closeLiveSessionByKey(`${cleanId}:audio_only`);
+    const viewerKey = getViewerKey(req, cleanId);
+    liveActiveViewers.delete(viewerKey);
+    pruneExpiredLiveState();
+    let remainingForLive = 0;
+    for (const v of liveActiveViewers.values()) {
+      if (v.lvId === cleanId) remainingForLive++;
+    }
+    if (remainingForLive === 0) {
+      closeLiveSessionByKey(`${cleanId}:low`);
+      closeLiveSessionByKey(`${cleanId}:normal`);
+      closeLiveSessionByKey(`${cleanId}:high`);
+      closeLiveSessionByKey(`${cleanId}:audio_only`);
+    }
     return res.json({ success: true });
+  });
+  app2.get("/api/nico/live/capacity", (_req, res) => {
+    pruneExpiredLiveState();
+    return res.json({
+      ok: true,
+      activeViewers: liveActiveViewers.size,
+      maxViewers: MAX_LIVE_VIEWERS_PER_INSTANCE,
+      activeSessions: nicoLiveSessions.size,
+      maxSessions: MAX_LIVE_SESSIONS_PER_INSTANCE,
+      full: liveActiveViewers.size >= MAX_LIVE_VIEWERS_PER_INSTANCE || nicoLiveSessions.size >= MAX_LIVE_SESSIONS_PER_INSTANCE
+    });
   });
   function readProtoVarint(buf, offset) {
     let res = 0n;
@@ -3344,10 +3503,35 @@ Cookie: ${allCookies}\r
   });
   const handleLiveMasterPlaylist = async (req, res) => {
     const cleanId = sanitizeId(req.params.id).toLowerCase();
-    const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
+    const qParam = String(req.query.quality || "").toLowerCase();
+    const qualityMode = qParam === "audio_only" ? "audio_only" : qParam === "high" ? "high" : qParam === "normal" ? "normal" : "low";
     const forceRefresh = req.query.refresh === "1";
-    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico.na8526130.workers.dev").replace(/\/+$/, "");
+    const viewerKey = getViewerKey(req, cleanId);
+    if (!hasLiveCapacity(cleanId, qualityMode, viewerKey)) {
+      return res.status(503).json({
+        ok: false,
+        success: false,
+        code: "LIVE_CAPACITY_FULL",
+        error: "\u73FE\u5728\u751F\u653E\u9001\u306E\u8996\u8074\u67A0\u304C\u6E80\u54E1\u3067\u3059\uFF08\u901A\u5E38\u52D5\u753B\u306F\u5229\u7528\u3067\u304D\u307E\u3059\uFF09"
+      });
+    }
+    touchLiveViewer(cleanId, viewerKey);
+    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico-2.na8526130.workers.dev").replace(/\/+$/, "");
+    const useWorkerProxy = Boolean(workerBase && req.path.startsWith("/api/tools/nikoniko"));
+    const masterCacheKey = `master:${cleanId}:${qualityMode}:${useWorkerProxy ? "w" : "d"}`;
+    if (!forceRefresh) {
+      const cached = getCachedLivePayload(masterCacheKey);
+      if (cached) {
+        res.setHeader("Content-Type", cached.contentType);
+        res.setHeader("Cache-Control", "public, max-age=1, s-maxage=2");
+        res.setHeader("X-Micro-Cache", "HIT");
+        return res.status(cached.status).send(cached.body);
+      }
+    }
     let sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, qualityMode);
+    if ((!sess || !sess.streamUri) && qualityMode === "low") {
+      sess = await getOrCreateNicoLiveSession(cleanId, forceRefresh, "normal");
+    }
     if (!sess || !sess.streamUri) {
       return res.status(502).json({ error: "\u751F\u653E\u9001\u30B9\u30C8\u30EA\u30FC\u30E0\u3092\u53D6\u5F97\u3067\u304D\u307E\u305B\u3093\u3067\u3057\u305F" });
     }
@@ -3363,7 +3547,7 @@ Cookie: ${allCookies}\r
         signal: AbortSignal.timeout(8e3)
       });
       if (resp.status === 403 || resp.status === 410) {
-        sess = await getOrCreateNicoLiveSession(cleanId, true, qualityMode);
+        sess = await getOrCreateNicoLiveSession(cleanId, true, sess.qualityMode);
         if (!sess || !sess.streamUri) return res.status(502).send("Live stream expired");
         cookieHeader = buildLiveCookieHeader(sess.cookies, sess.streamUri);
         resp = await fetch(sess.streamUri, {
@@ -3382,23 +3566,24 @@ Cookie: ${allCookies}\r
         k: sess.cookies.map((c) => ({ n: c.name, v: c.value, p: c.path }))
       });
       const tkQuery = liveTk ? `&tk=${encodeURIComponent(liveTk)}` : "";
-      const useWorkerProxy = Boolean(workerBase && req.path.startsWith("/api/tools/nikoniko"));
       const viaQuery = useWorkerProxy ? "&via=worker" : "";
       const proxyBase = useWorkerProxy ? `${workerBase}/live/${encodeURIComponent(cleanId)}/proxy` : "/api/nico/live/hls/proxy";
       text = text.replace(/(URI=")([^"]+)(")/g, (_m, p1, uri, p3) => {
         const abs = new URL(uri, base).toString();
-        return `${p1}${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}${p3}`;
+        return `${p1}${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${sess.qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}${p3}`;
       });
       text = text.split(/\r?\n/).map((line) => {
         const trimmed = line.trim();
         if (trimmed && !trimmed.startsWith("#")) {
           const abs = new URL(trimmed, base).toString();
-          return `${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}`;
+          return `${proxyBase}?id=${encodeURIComponent(cleanId)}&quality=${sess.qualityMode}${tkQuery}${viaQuery}&url=${encodeURIComponent(abs)}`;
         }
         return line;
       }).join("\n");
+      setCachedLivePayload(masterCacheKey, 200, "application/vnd.apple.mpegurl", text);
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Cache-Control", "public, max-age=1, s-maxage=2");
+      res.setHeader("X-Micro-Cache", "MISS");
       return res.send(text);
     } catch (err) {
       return res.status(500).send(err?.message || "Live HLS error");
@@ -3409,13 +3594,29 @@ Cookie: ${allCookies}\r
   app2.get("/api/nico/live/hls/proxy", async (req, res) => {
     const cleanId = sanitizeId(String(req.query.id || "")).toLowerCase();
     const targetUrl = String(req.query.url || "").trim();
-    const qualityMode = req.query.quality === "audio_only" ? "audio_only" : "high";
+    const qParam = String(req.query.quality || "").toLowerCase();
+    const qualityMode = qParam === "audio_only" ? "audio_only" : qParam === "high" ? "high" : qParam === "normal" ? "normal" : "low";
     const rawTk = String(req.query.tk || "");
-    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico.na8526130.workers.dev").replace(/\/+$/, "");
+    const workerBase = String(process.env.CF_WORKER_URL || "https://niconico-2.na8526130.workers.dev").replace(/\/+$/, "");
     const useWorkerProxy = Boolean(workerBase && req.query.via === "worker");
     const viaQuery = useWorkerProxy ? "&via=worker" : "";
     const subProxyBase = useWorkerProxy ? `${workerBase}/live/${encodeURIComponent(cleanId)}/proxy` : "/api/nico/live/hls/proxy";
     if (!cleanId || !targetUrl) return res.status(400).send("Missing params");
+    const proxyCacheKey = !req.headers.range ? `proxy:${cleanId}:${qualityMode}:${useWorkerProxy ? "w" : "d"}:${targetUrl}` : "";
+    if (proxyCacheKey) {
+      const cached = getCachedLivePayload(proxyCacheKey);
+      if (cached) {
+        res.setHeader("Content-Type", cached.contentType);
+        res.setHeader("Cache-Control", "public, max-age=1, s-maxage=2");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("X-Micro-Cache", "HIT");
+        if (Buffer.isBuffer(cached.body)) {
+          res.setHeader("Content-Length", cached.body.length);
+          return res.status(cached.status).end(cached.body);
+        }
+        return res.status(cached.status).send(cached.body);
+      }
+    }
     const sessionKey = `${cleanId}:${qualityMode}`;
     const existingSess = nicoLiveSessions.get(sessionKey);
     if (existingSess) {
@@ -3470,15 +3671,24 @@ Cookie: ${allCookies}\r
           }
           return line;
         }).join("\n");
+        if (proxyCacheKey) {
+          setCachedLivePayload(proxyCacheKey, 200, "application/vnd.apple.mpegurl", text);
+        }
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Cache-Control", "public, max-age=1, s-maxage=2");
+        res.setHeader("X-Micro-Cache", "MISS");
         return res.send(text);
       }
       const buf = Buffer.from(await resp.arrayBuffer());
+      if (proxyCacheKey && resp.status === 200) {
+        setCachedLivePayload(proxyCacheKey, 200, ct || "video/mp2t", buf);
+      }
       res.status(resp.status);
       res.setHeader("Content-Type", ct || "video/mp2t");
       res.setHeader("Accept-Ranges", "bytes");
       res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Cache-Control", resp.status === 200 ? "public, max-age=1, s-maxage=2" : "no-store");
+      res.setHeader("X-Micro-Cache", "MISS");
       res.setHeader("Content-Length", buf.length);
       const cr = resp.headers.get("content-range");
       if (cr) res.setHeader("Content-Range", cr);
